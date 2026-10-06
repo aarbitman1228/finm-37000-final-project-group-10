@@ -33,7 +33,7 @@ Each team member confirms they have reviewed this README and the open Issues, an
 |------|-----------|
 | Andrew Arbitman | I agree — @aarbitman1228 |
 | Rodrigo Castillo | I agree — @ |
-| Xiaohan Zhu | I agree — @ |
+| Xiaohan Zhu | I agree — @zhucolatee |
 | Jessica Xu | I agree — @Jessicakk0711 |
 
 > To register your agreement: edit this table to add your name and GitHub handle, or leave a comment or reaction on the PR that introduced this README.
