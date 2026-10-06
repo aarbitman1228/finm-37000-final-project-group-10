@@ -24,3 +24,16 @@ Instead of relying on lagging indicators from executed trades, this project util
    Execute `python src/backtester.py --imbalance_threshold 0.75 --take_profit_ticks 2` to run the historical simulation.
 6. **Review Outcomes:** 
    The engine will generate a `results_summary.txt` detailing total trades, win rate, and net PnL, along with a `visualizations/` folder containing charts of the order book imbalance overlaid with execution markers.
+
+## Team Agreement
+
+Each team member confirms they have reviewed this README and the open Issues, and agrees this plan accurately reflects what the team discussed.
+
+| Name | Agreement |
+|------|-----------|
+| Andrew Arbitman | I agree — @ |
+| Rodrigo Castillo | I agree — @ |
+| Xiaohan Zhu | I agree — @ |
+| Jessica Xu | I agree — @Jessicakk0711 |
+
+> To register your agreement: edit this table to add your name and GitHub handle, or leave a comment or reaction on the PR that introduced this README.
