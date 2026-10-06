@@ -31,7 +31,7 @@ Each team member confirms they have reviewed this README and the open Issues, an
 
 | Name | Agreement |
 |------|-----------|
-| Andrew Arbitman | I agree — @ |
+| Andrew Arbitman | I agree — @aarbitman1228 |
 | Rodrigo Castillo | I agree — @ |
 | Xiaohan Zhu | I agree — @ |
 | Jessica Xu | I agree — @Jessicakk0711 |
