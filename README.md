@@ -32,7 +32,7 @@ Each team member confirms they have reviewed this README and the open Issues, an
 | Name | Agreement |
 |------|-----------|
 | Andrew Arbitman | I agree — @aarbitman1228 |
-| Rodrigo Castillo | I agree — @ |
+| Rodrigo Castillo | I agree — @RoCa5tillo |
 | Xiaohan Zhu | I agree — @zhucolatee |
 | Jessica Xu | I agree — @Jessicakk0711 |
 
