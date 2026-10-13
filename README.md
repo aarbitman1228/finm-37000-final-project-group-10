@@ -65,11 +65,13 @@ Other options include `--stop_loss_ticks`, `--quantity`, `--latency_us` (extra o
 5. **Calculate Order Book Imbalance:**
    Run `python src/order_book_imbalance.py` to process all Parquet files in `data/raw/`. Results are saved in `data/processed/`, with previously processed files reused when available.
 6. **Generate Trading Signals:**
-   Run `python src/trading_signals.py` to generate BUY, SELL, and NEUTRAL signals using the calculated OBI (default threshold: 0.75). Results are saved in `data/signals/`.
+   (keep the existing text from main)
 7. **Run the Backtest Simulation:** 
-   Execute `python src/backtester.py --imbalance_threshold 0.75 --take_profit_ticks 2` to run the historical simulation. Missing OBI or signal files for the chosen threshold are generated automatically. It prints a summary and writes `results/trade_log.csv` (one row per fill) and `results/equity_curve.csv` (mark-to-market equity, sampled each minute and at every fill). To test the engine, run `pip install pytest` and then `pytest tests/test_backtester.py`.
+   Execute `python src/backtester.py --imbalance_threshold 0.75 --take_profit_ticks 2` to run the historical simulation.
 8. **Review Outcomes:** 
-   The reporting module reads `results/trade_log.csv` and generates a `results_summary.txt` detailing total trades, win rate, and net PnL, along with a `visualizations/` folder containing charts of the order book imbalance overlaid with execution markers.
+   The reporting module reads the backtester output (`results/trade_log.csv` and, if present, `results/equity_curve.csv`):
+   `python src/reporting.py --symbol CL --imbalance_threshold 0.75`
+   This writes `results_summary.txt` (net PnL, win rate, trade count, max drawdown, plus a cross-check against the engine's `realized_pnl`), `visualizations/equity_curve.png`, and `visualizations/price_and_obi.png`. Use `--trades` / `--equity` to point at other files, and run the tests with `pytest tests/`.
 
 ## Team Agreement
 
