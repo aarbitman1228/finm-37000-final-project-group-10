@@ -219,3 +219,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+data/processed/CL_c_0_mbp-10_2026-10-04_2026-10-05_OBI_levels_0.parquet
+data/processed/CL_c_0_mbp-10_2026-10-05_2026-10-06_OBI_levels_0.parquet
+/data/processed
+src/Check.ipynb
+data/.DS_Store
