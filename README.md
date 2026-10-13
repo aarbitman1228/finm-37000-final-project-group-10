@@ -15,11 +15,11 @@ Instead of relying on lagging indicators from executed trades, this project util
 1. **Clone the repository:** 
    `git clone https://github.com/aarbitman1228/finm-37000-final-project-group-10.git`
 2. **Install dependencies:** 
-   `pip install -r requirements.txt` (requires `pandas`, `numpy`, `databento`, `matplotlib`)
+   `pip install -r requirements.txt` (installs `databento`, `pandas`, `pyarrow`, and `python-dotenv`)
 3. **Configure API:** 
    Create a `.env` file in the root directory and add your Databento API key: `DATABENTO_API_KEY=your_key_here`.
 4. **Fetch Limit Order Data:** 
-   Run `python src/fetch_mbp_data.py`. This will authenticate with Databento and download the MBP-10 order book snapshots for the specified date range, saving them locally to `data/raw/` to avoid repeated API calls.
+   Run `python src/fetch_mbp_data.py` from a terminal for a one-week CL sample (October 4–10, 2026; the end date is exclusive). The script checks each day's estimated size and cost, asks once for confirmation, and saves one compressed Parquet file per day in `data/raw/`. Completed daily files are reused if a run is restarted. Use `--symbol GC.c.0` or `--symbol SI.c.0` to select another contract, or `--start` and `--end` to change the date range.
 5. **Run the Backtest Simulation:** 
    Execute `python src/backtester.py --imbalance_threshold 0.75 --take_profit_ticks 2` to run the historical simulation.
 6. **Review Outcomes:** 
