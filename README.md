@@ -43,9 +43,9 @@ The resulting OBI ranges from -1 to 1, where positive values indicate greater bi
    Execute `python src/backtester.py --imbalance_threshold 0.75 --take_profit_ticks 2` to run the historical simulation.
 7. **Review Outcomes:** 
    The engine will generate a `results_summary.txt` detailing total trades, win rate, and net PnL, along with a `visualizations/` folder containing charts of the order book imbalance overlaid with execution markers.
-   The reporting module can also be run on its own against a trade log (`.parquet` or `.csv` with columns `ts_event`, `side`, `price`, and optionally `quantity` and `fee`):
-   `python src/reporting.py --trades path/to/trades.parquet --symbol CL --imbalance_threshold 0.75`
-   This writes `results_summary.txt` (net PnL, win rate, trade count, max drawdown), `visualizations/equity_curve.png`, and `visualizations/price_and_obi.png`. Run the tests with `pytest tests/`.
+   The reporting module reads the backtester output (`results/trade_log.csv` and, if present, `results/equity_curve.csv`):
+   `python src/reporting.py --symbol CL --imbalance_threshold 0.75`
+   This writes `results_summary.txt` (net PnL, win rate, trade count, max drawdown, plus a cross-check against the engine's `realized_pnl`), `visualizations/equity_curve.png`, and `visualizations/price_and_obi.png`. Use `--trades` / `--equity` to point at other files, and run the tests with `pytest tests/`.
 
 ## Team Agreement
 

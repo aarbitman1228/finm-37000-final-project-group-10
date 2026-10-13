@@ -146,6 +146,55 @@ def test_generate_report_writes_files(tmp_path):
     assert (out_dir / "price_and_obi.png").stat().st_size > 0
 
 
+def make_engine_log() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Mimic results/trade_log.csv and results/equity_curve.csv from backtester.py."""
+    log = make_trades()
+    log["ts_recv"] = log["ts_event"] + pd.Timedelta(microseconds=50)
+    log["reason"] = ["entry_long", "take_profit", "entry_short", "obi_neutral", "entry_long", "end_of_data"]
+    # Gross realized PnL is only non-zero on closing fills (CL multiplier = 1000).
+    log["realized_pnl"] = [0.0, 1000.0, 0.0, -500.0, 0.0, 250.0]
+
+    equity = pd.DataFrame(
+        {
+            "ts_recv": log["ts_recv"],
+            "position": [1, 0, -1, 0, 1, 0],
+            "cash": [99_998.0, 100_996.0, 100_994.0, 100_492.0, 100_490.0, 100_738.0],
+            "equity": [99_998.0, 100_996.0, 100_994.0, 100_492.0, 100_490.0, 100_738.0],
+        }
+    )
+    return log, equity
+
+
+def test_engine_csv_roundtrip_and_equity_curve(tmp_path):
+    log, equity = make_engine_log()
+    log["ts_event"] = log["ts_event"].astype(str)
+    log["ts_recv"] = log["ts_recv"].astype(str)
+    equity["ts_recv"] = equity["ts_recv"].astype(str)
+    log.to_csv(tmp_path / "trade_log.csv", index=False)
+    equity.to_csv(tmp_path / "equity_curve.csv", index=False)
+
+    metrics = reporting.compute_metrics(
+        reporting.load_trades(tmp_path / "trade_log.csv"),
+        multiplier=1000.0,
+        equity_curve=reporting.load_trades(tmp_path / "equity_curve.csv"),
+    )
+
+    assert metrics["equity_source"] == "engine mark-to-market"
+    assert metrics["final_equity"] == pytest.approx(100_738.0)
+    assert metrics["total_net_pnl"] == pytest.approx(738.0)
+    # Peak 100996 -> trough 100490.
+    assert metrics["max_drawdown"] == pytest.approx(506.0)
+
+
+def test_engine_gross_pnl_cross_check():
+    log, _ = make_engine_log()
+    metrics = reporting.compute_metrics(log, multiplier=1000.0)
+
+    assert metrics["engine_gross_pnl"] == pytest.approx(750.0)
+    assert metrics["total_gross_pnl"] == pytest.approx(metrics["engine_gross_pnl"])
+    assert "Engine gross PnL check" in reporting.format_summary(metrics)
+
+
 def test_select_window_prefers_busiest_period():
     market_times = pd.Series(pd.date_range("2026-10-05", periods=100, freq="1min", tz="UTC"))
     fill_times = pd.Series(

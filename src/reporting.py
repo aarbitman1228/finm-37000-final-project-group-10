@@ -2,12 +2,17 @@
 
 Inputs
 ------
-Trade log (one row per filled order; produced by the execution engine, Issue #17):
+Trade log (``results/trade_log.csv``, one row per fill; written by backtester.py, Issue #17):
     ts_event : timestamp of the fill
     side     : "BUY" / "SELL" (case-insensitive) or +1 / -1
     price    : execution price
     quantity : number of contracts, positive (optional, defaults to 1)
     fee      : total exchange + routing fee for the fill (optional, defaults to 0)
+    realized_pnl : optional, engine PnL gross of fees; used only as a cross-check
+
+Equity curve (``results/equity_curve.csv``, optional):
+    ts_recv, equity : mark-to-market equity; when present it drives the equity
+                      chart, final equity and max drawdown.
 
 Market data (used only for plotting):
     ts_event, OBI, and either ``price`` or both ``bid_px_00`` and ``ask_px_00``
@@ -41,6 +46,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_RAW_DIR = ROOT / "data" / "raw"
 DEFAULT_PROCESSED_DIR = ROOT / "data" / "processed"
+DEFAULT_TRADES_PATH = ROOT / "results" / "trade_log.csv"
 DEFAULT_SUMMARY_PATH = ROOT / "results_summary.txt"
 DEFAULT_VISUALIZATION_DIR = ROOT / "visualizations"
 
@@ -200,25 +206,61 @@ def max_drawdown(equity: pd.Series) -> tuple[float, float]:
     return dollars, fraction
 
 
+def normalize_equity_curve(equity_curve: pd.DataFrame) -> pd.DataFrame:
+    """Standardize an engine equity curve (``ts_recv`` or ``ts_event`` plus ``equity``)."""
+    time_col = "ts_recv" if "ts_recv" in equity_curve.columns else "ts_event"
+    if time_col not in equity_curve.columns or "equity" not in equity_curve.columns:
+        raise ValueError("Equity curve needs a 'ts_recv' (or 'ts_event') and an 'equity' column.")
+
+    out = pd.DataFrame(
+        {
+            "ts_event": pd.to_datetime(equity_curve[time_col], utc=True),
+            "equity": equity_curve["equity"].astype(float),
+        }
+    )
+    return out.sort_values("ts_event", kind="stable").reset_index(drop=True)
+
+
 def compute_metrics(
     trades: pd.DataFrame,
     initial_cash: float = DEFAULT_INITIAL_CASH,
     multiplier: float = 1.0,
+    equity_curve: pd.DataFrame | None = None,
 ) -> dict:
-    """Compute summary performance metrics from a raw trade log."""
+    """Compute summary performance metrics from a raw trade log.
+
+    When the engine's mark-to-market ``equity_curve`` is supplied it is used for
+    the equity chart, final equity and max drawdown. Otherwise a realized-PnL
+    curve is rebuilt from the round trips.
+
+    If the trade log contains the engine's ``realized_pnl`` column (gross of
+    fees), it is summed and reported next to the recomputed PnL as a check.
+    """
     fills = normalize_trades(trades)
     round_trips = build_round_trips(trades, multiplier=multiplier)
-    equity_curve = build_equity_curve(
-        round_trips,
-        initial_cash=initial_cash,
-        start_time=fills["ts_event"].min() if not fills.empty else None,
-    )
+
+    if equity_curve is not None and len(equity_curve):
+        equity_curve = normalize_equity_curve(equity_curve)
+        equity_source = "engine mark-to-market"
+    else:
+        equity_curve = build_equity_curve(
+            round_trips,
+            initial_cash=initial_cash,
+            start_time=fills["ts_event"].min() if not fills.empty else None,
+        )
+        equity_source = "realized PnL from trade log"
 
     n_trips = len(round_trips)
     n_wins = int((round_trips["net_pnl"] > 0).sum()) if n_trips else 0
     drawdown, drawdown_pct = max_drawdown(equity_curve["equity"])
 
+    engine_gross_pnl = None
+    if "realized_pnl" in trades.columns and len(trades):
+        engine_gross_pnl = float(trades["realized_pnl"].astype(float).sum())
+
     return {
+        "equity_source": equity_source,
+        "engine_gross_pnl": engine_gross_pnl,
         "initial_cash": float(initial_cash),
         "final_equity": float(equity_curve["equity"].iloc[-1]) if len(equity_curve) else float(initial_cash),
         "total_net_pnl": float(round_trips["net_pnl"].sum()) if n_trips else 0.0,
@@ -257,7 +299,14 @@ def format_summary(metrics: dict, symbol: str | None = None) -> str:
         f"Win rate:                {win_rate_text}",
         f"Max drawdown:            ${metrics['max_drawdown']:,.2f} ({metrics['max_drawdown_pct']:.2%})",
         f"Open position at end:    {metrics['open_position']:g} contracts",
+        f"Equity curve source:     {metrics['equity_source']}",
     ]
+    engine_gross = metrics.get("engine_gross_pnl")
+    if engine_gross is not None:
+        diff = metrics["total_gross_pnl"] - engine_gross
+        lines.append(
+            f"Engine gross PnL check:  ${engine_gross:,.2f} (difference ${diff:,.2f})"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -408,9 +457,15 @@ def generate_report(
     symbol: str | None = None,
     obi_threshold: float | None = None,
     window_minutes: float = DEFAULT_WINDOW_MINUTES,
+    equity_curve: pd.DataFrame | None = None,
 ) -> dict:
     """Compute metrics and write the summary file and both charts."""
-    metrics = compute_metrics(trades, initial_cash=initial_cash, multiplier=multiplier)
+    metrics = compute_metrics(
+        trades,
+        initial_cash=initial_cash,
+        multiplier=multiplier,
+        equity_curve=equity_curve,
+    )
 
     write_summary(metrics, summary_path, symbol)
     visualization_dir = Path(visualization_dir)
@@ -445,7 +500,11 @@ def load_market_data(
 ) -> pd.DataFrame:
     """Join raw top-of-book prices with the cached OBI files (same row order)."""
     raw_dir, processed_dir = Path(raw_dir), Path(processed_dir)
-    obi_files = sorted(processed_dir.glob("*_OBI_levels_*.parquet"))
+    obi_files = sorted(
+        path
+        for path in processed_dir.glob("*_OBI_levels_*.parquet")
+        if "_signals_" not in path.name
+    )
     if not obi_files:
         raise FileNotFoundError(f"No processed OBI files found in {processed_dir}")
 
@@ -476,7 +535,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate performance metrics and charts from a backtest trade log."
     )
-    parser.add_argument("--trades", type=Path, required=True, help="Trade log (.parquet or .csv).")
+    parser.add_argument("--trades", type=Path, default=DEFAULT_TRADES_PATH,
+                        help="Trade log written by backtester.py (.csv or .parquet).")
+    parser.add_argument("--equity", type=Path, default=None,
+                        help="Engine equity curve; defaults to equity_curve.csv next to the trade log.")
     parser.add_argument("--symbol", choices=sorted(CONTRACT_MULTIPLIERS), default="CL")
     parser.add_argument("--initial_cash", type=float, default=DEFAULT_INITIAL_CASH)
     parser.add_argument("--raw_dir", type=Path, default=DEFAULT_RAW_DIR)
@@ -495,6 +557,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     trades = load_trades(args.trades)
+
+    equity_path = args.equity or args.trades.with_name("equity_curve.csv")
+    equity_curve = load_trades(equity_path) if equity_path.exists() else None
 
     market = None
     if not args.skip_market_plot:
@@ -517,6 +582,7 @@ def main() -> None:
         symbol=args.symbol,
         obi_threshold=args.imbalance_threshold,
         window_minutes=args.window_minutes,
+        equity_curve=equity_curve,
     )
     print(format_summary(metrics, args.symbol))
     print(f"Summary written to {args.summary_path}")
