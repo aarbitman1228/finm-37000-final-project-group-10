@@ -39,6 +39,20 @@ Trading signals are generated based on the calculated OBI using a configurable t
 The script processes OBI data from `data/processed/` and saves the resulting signals in `data/signals/`. Previously generated files are reused when available.
 
 
+## Backtest Execution Engine
+
+`src/backtester.py` steps through every MBP-10 book event in the order Databento received it and simulates trading on the signals:
+
+* **Entry:** when flat, buy 1 contract on a BUY signal and sell 1 contract on a SELL signal.
+* **Exit:** take-profit or stop-loss when the mid price has moved the set number of ticks (default 2) from the mid at entry, or when OBI crosses back through 0.
+* **Execution:** a decision made on one book event fills on the next valid event, so the strategy never trades at the quote that produced its signal. Buys pay `ask_px_00` and sells receive `bid_px_00`.
+* **Book quality:** only events that complete an exchange packet (Databento `F_LAST` flag) with an uncrossed book are used, so trading halts and pre-open auctions are not traded.
+* **Trading hours:** no trading during the CME 16:00–17:00 CT maintenance break or the weekend; positions are flattened and entries stop 1 minute before the 16:00 CT close. Any position left at the end of the data is closed at the last quote.
+* **Portfolio:** starts with $100,000. As with futures, cash changes only by realized PnL and fees; equity also includes open-position PnL marked at the bid (long) or ask (short). New entries stop once equity reaches zero.
+* **Fees:** $1.50 CME exchange fee plus $0.50 routing fee per contract per fill (`--exchange_fee`, `--routing_fee`). These are approximate and configurable.
+
+Other options include `--stop_loss_ticks`, `--quantity`, `--latency_us` (extra order delay) and `--flatten_minutes`. The trade log columns `ts_event, side, price, quantity, fee` are the input format for the reporting module.
+
 ## How to Run the Project
 1. **Clone the repository:** 
    `git clone https://github.com/aarbitman1228/finm-37000-final-project-group-10.git`
@@ -52,10 +66,10 @@ The script processes OBI data from `data/processed/` and saves the resulting sig
    Run `python src/order_book_imbalance.py` to process all Parquet files in `data/raw/`. Results are saved in `data/processed/`, with previously processed files reused when available.
 6. **Generate Trading Signals:**
    Run `python src/trading_signals.py` to generate BUY, SELL, and NEUTRAL signals using the calculated OBI (default threshold: 0.75). Results are saved in `data/signals/`.
-9. **Run the Backtest Simulation:** 
-   Execute `python src/backtester.py --imbalance_threshold 0.75 --take_profit_ticks 2` to run the historical simulation.
-10. **Review Outcomes:** 
-   The engine will generate a `results_summary.txt` detailing total trades, win rate, and net PnL, along with a `visualizations/` folder containing charts of the order book imbalance overlaid with execution markers.
+7. **Run the Backtest Simulation:** 
+   Execute `python src/backtester.py --imbalance_threshold 0.75 --take_profit_ticks 2` to run the historical simulation. Missing OBI or signal files for the chosen threshold are generated automatically. It prints a summary and writes `results/trade_log.csv` (one row per fill) and `results/equity_curve.csv` (mark-to-market equity, sampled each minute and at every fill). To test the engine, run `pip install pytest` and then `pytest tests/test_backtester.py`.
+8. **Review Outcomes:** 
+   The reporting module reads `results/trade_log.csv` and generates a `results_summary.txt` detailing total trades, win rate, and net PnL, along with a `visualizations/` folder containing charts of the order book imbalance overlaid with execution markers.
 
 ## Team Agreement
 
