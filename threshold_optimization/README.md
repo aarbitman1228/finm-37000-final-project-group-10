@@ -17,8 +17,13 @@ With the five full CL daily MBP-10 Parquet files for October 5–10, 2026 in
 ```bash
 python src/threshold_analysis.py \
   --start-date 2026-10-05 \
-  --end-date 2026-10-10
+  --end-date 2026-10-10 \
+  --fill-model next_event
 ```
+
+These results use the backtester's original next-event fill approximation.
+Without `--fill-model next_event` the tool uses the latency model, which is
+now the backtester default; see [`latency_analysis/`](../latency_analysis/).
 
 The tool calculates level-0 OBI and runs the existing event-driven backtester
 independently on each daily file at 0.75, 0.85, 0.90, and 0.95. Each daily run

@@ -6,6 +6,10 @@ with the cost of crossing the spread in and out plus fees. Signals are then
 grouped by the spread (in ticks) and by the size shown at the touch, showing
 where the signal pays for itself, if anywhere.
 
+Moves and costs are measured from the signal's own quote, as if an order
+filled instantly. ``latency_analysis.py`` measures the extra entry cost of
+realistic latency, so the net edge here is optimistic.
+
 Outputs
 -------
 * ``results/spread_size_analysis.csv``: one row per horizon, dimension and bucket.

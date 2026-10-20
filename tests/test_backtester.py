@@ -1,12 +1,13 @@
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from backtester import BacktestConfig, Portfolio, run_backtest, session_masks  # noqa: E402
+from backtester import BacktestConfig, Portfolio, book_at, exchange_clock, run_backtest, session_masks  # noqa: E402
 
 # Tuesday 2026-10-06 10:00 CT, regular trading hours.
 START = pd.Timestamp("2026-10-06 15:00:00", tz="UTC")
@@ -37,7 +38,18 @@ def make_market(rows, start=START, step_ms=1):
 
 
 def run(rows, start=START, step_ms=1, **config):
+    """Backtest rows spaced ``step_ms`` apart.
+
+    Unless overridden, an order takes one event spacing to reach the exchange
+    and its fill report is instant, so every order fills on the next event.
+    """
+    config.setdefault("order_latency_us", step_ms * 1_000)
+    config.setdefault("response_latency_us", 0.0)
     return run_backtest(make_market(rows, start, step_ms), BacktestConfig(**config))
+
+
+def at(ms):
+    return START + pd.Timedelta(microseconds=round(ms * 1_000))
 
 
 def test_long_take_profit_crosses_spread_and_pays_fees():
@@ -103,15 +115,201 @@ def test_fills_skip_crossed_books_and_incomplete_packets():
         (100.00, 100.02, 0.9, 1),        # entry fills here at 100.02
     ])
     assert result["trades"]["price"].iloc[0] == 100.02
+    # The order reached the exchange at 1 ms and waited for the valid book at 3 ms.
+    assert result["trades"]["ts_event"].iloc[0] == at(3)
     assert result["stats"]["tradable_events"] == 2
 
 
-def test_latency_delays_fill():
+def test_order_fills_against_book_when_it_reaches_exchange():
     result = run(
         [(100.00, 100.01, 0.9, 1), (100.00, 100.02, 0.9, 1), (100.00, 100.03, 0.9, 1)],
-        latency_us=1_500,
+        order_latency_us=1_500,
+        response_latency_us=200,
     )
-    assert result["trades"]["price"].iloc[0] == 100.03
+    entry = result["trades"].iloc[0]
+    # Arrives at 1.5 ms: the book is still the one from 1 ms, not the next event at 2 ms.
+    assert entry["price"] == 100.02
+    assert entry["decision_price"] == 100.01
+    assert entry["ts_sent"] == at(0)
+    assert entry["ts_event"] == at(1.5)
+    assert entry["ts_recv"] == at(1.7)
+
+
+def test_zero_latency_fills_at_decision_quote():
+    result = run(
+        [(100.00, 100.01, 0.9, 1), (100.00, 100.02, 0.9, 1), (100.00, 100.03, 0.9, 1)],
+        order_latency_us=0,
+    )
+    assert result["trades"]["price"].iloc[0] == 100.01
+    assert result["stats"]["entry_slippage_ticks"] == pytest.approx(0.0)
+
+
+def test_order_meets_exchange_book_the_strategy_has_not_received():
+    market = make_market([
+        (100.00, 100.01, 0.9, 1),   # happened at 0.0 ms, received at 0.5 ms: signal
+        (100.00, 100.02, 0.9, 1),   # happened at 0.1 ms, received at 0.6 ms
+        (100.00, 100.03, 0.9, 1),   # happened at 0.3 ms, received at 0.8 ms
+        (100.00, 100.04, 0.9, 1),   # happened at 0.9 ms, received at 1.4 ms
+    ], step_ms=0.1)
+    market["ts_recv"] = [at(0.5), at(0.6), at(0.8), at(1.4)]
+    market["ts_event"] = [at(0.0), at(0.1), at(0.3), at(0.9)]
+
+    # Sent at 0.5 ms, arrives at 0.7 ms: the exchange book is the 0.3 ms one,
+    # which the strategy only receives at 0.8 ms.
+    latency = run_backtest(market, BacktestConfig(order_latency_us=200, response_latency_us=0))
+    assert latency["trades"]["price"].iloc[0] == 100.03
+
+    # The next-event approximation fills on the 0.1 ms book, which existed
+    # before the decision was made.
+    next_event = run_backtest(market, BacktestConfig(fill_model="next_event"))
+    first = next_event["trades"].iloc[0]
+    assert first["price"] == 100.02
+    assert first["ts_event"] < first["ts_sent"]
+
+
+def test_strategy_waits_for_fill_report_then_uses_newest_book():
+    result = run(
+        [
+            (100.00, 100.01, 0.9, 1),    # 0 ms: entry, fills at 0.1 ms; report at 2.6 ms
+            (100.00, 100.01, -0.1, 0),   # 1 ms: exit condition, but no fill report yet
+            (100.00, 100.01, -0.1, 0),   # 2 ms: newest book when the report arrives
+            (99.98, 99.99, -0.1, 0),     # 3 ms
+            (99.98, 99.99, -0.1, 0),
+        ],
+        order_latency_us=100,
+        response_latency_us=2_500,
+    )
+    entry, exit_ = result["trades"].iloc[0], result["trades"].iloc[1]
+    assert entry["ts_recv"] == at(2.6)
+    assert exit_["reason"] == "obi_neutral"
+    assert exit_["decision_ts_recv"] == at(2)
+    assert exit_["ts_sent"] == at(2.6)
+    assert exit_["ts_event"] == at(2.7)
+    assert exit_["price"] == 100.00
+
+
+def test_feed_latency_delays_what_the_strategy_sees():
+    rows = [(100.00, 100.01, 0.9, 1), (100.00, 100.02, 0.9, 1), (100.00, 100.03, 0.9, 1)]
+    result = run(rows, feed_latency_us=1_000, order_latency_us=0)
+    entry = result["trades"].iloc[0]
+    # The 0 ms signal is seen at 1 ms, when the exchange book is already the 1 ms one.
+    assert entry["ts_sent"] == at(1)
+    assert entry["decision_ts_recv"] == at(0)
+    assert entry["price"] == 100.02
+
+
+def test_fill_report_does_not_reevaluate_a_book_already_acted_on():
+    market = make_market([
+        (100.00, 100.01, 0.9, 1),   # happened at 0.0 ms, received at 0.5 ms: entry
+        (100.02, 100.03, 0.9, 1),   # happened at 0.1 ms, received at 5 ms: the order fills here
+        (100.02, 100.03, 0.9, 1),
+    ])
+    market["ts_recv"] = [at(0.5), at(5), at(6.5)]
+    market["ts_event"] = [at(0.0), at(0.1), at(6)]
+    result = run_backtest(market, BacktestConfig(order_latency_us=200, response_latency_us=100))
+
+    # The report arrives at 0.8 ms, before the 0.1 ms book is received. Judging the
+    # fill against the old 0 ms book would show a 2-tick loss and trigger the stop.
+    assert list(result["trades"]["reason"]) == ["entry_long", "end_of_data"]
+
+
+def test_fill_report_without_new_book_waits_for_next_event():
+    result = run(
+        [
+            (100.00, 100.01, 0.9, 1),    # 0 ms: entry fills at once; report at 1 ms
+            (100.00, 100.01, -0.1, 0),   # 10 ms: first new book -> exit
+            (100.00, 100.01, -0.1, 0),
+        ],
+        step_ms=10,
+        order_latency_us=0,
+        response_latency_us=1_000,
+    )
+    exit_ = result["trades"].iloc[1]
+    assert exit_["reason"] == "obi_neutral"
+    assert exit_["ts_sent"] == at(10)
+
+
+def test_order_arriving_after_data_ends_is_not_filled():
+    result = run(
+        [(100.00, 100.01, 0.0, 0), (100.00, 100.01, 0.0, 0), (100.00, 100.01, 0.9, 1)],
+        order_latency_us=50,
+    )
+    assert result["trades"].empty
+
+
+def test_fill_is_kept_when_its_report_arrives_after_data_ends():
+    result = run(
+        [(100.00, 100.01, 0.9, 1), (100.01, 100.02, 0.9, 1)],
+        order_latency_us=0,
+        response_latency_us=10_000,
+    )
+    trades = result["trades"]
+    assert list(trades["reason"]) == ["entry_long", "end_of_data"]
+    assert list(trades["price"]) == [100.01, 100.01]
+    assert result["portfolio"].position == 0
+
+
+def churning_market(n=200):
+    """OBI alternates between a buy signal and neutral, so the strategy trades all the time."""
+    rows = [(100.00, 100.01, 0.9, 1) if k % 2 == 0 else (100.00, 100.01, -0.1, 0) for k in range(n)]
+    return make_market(rows, step_ms=0.2)
+
+
+def test_latency_jitter_is_seeded_and_only_adds_delay():
+    config = dict(order_latency_us=100, response_latency_us=100, latency_jitter_us=300)
+    first = run_backtest(churning_market(), BacktestConfig(seed=7, **config))["trades"]
+    again = run_backtest(churning_market(), BacktestConfig(seed=7, **config))["trades"]
+    other = run_backtest(churning_market(), BacktestConfig(seed=8, **config))["trades"]
+
+    assert len(first) > 10
+    assert first.equals(again)
+    assert not first.equals(other)
+    filled = first[first["reason"] != "end_of_data"]
+    assert ((filled["ts_event"] - filled["ts_sent"]) >= pd.Timedelta(microseconds=100)).all()
+    assert ((filled["ts_recv"] - filled["ts_event"]) >= pd.Timedelta(microseconds=100)).all()
+    assert (filled["ts_event"] - filled["ts_sent"]).nunique() > 1
+
+
+def test_one_order_at_a_time():
+    trades = run_backtest(churning_market(), BacktestConfig(order_latency_us=300, response_latency_us=300))["trades"]
+    filled = trades[trades["reason"] != "end_of_data"]
+    # Each order is sent only after the previous fill report arrived.
+    assert (filled["ts_sent"].iloc[1:].to_numpy() >= filled["ts_recv"].iloc[:-1].to_numpy()).all()
+    assert trades["ts_event"].is_monotonic_increasing
+
+
+def test_next_event_model_ignores_latency_settings():
+    rows = [(100.00, 100.01, 0.9, 1), (100.00, 100.02, 0.9, 1), (100.00, 100.03, 0.9, 1)]
+    result = run(rows, fill_model="next_event", order_latency_us=1_500, feed_latency_us=500)
+    entry = result["trades"].iloc[0]
+    assert entry["price"] == 100.02
+    assert entry["ts_event"] == entry["ts_recv"] == at(1)
+
+
+def test_slippage_and_holding_time_stats():
+    result = run([
+        (100.00, 100.01, 0.9, 1),   # decide to buy at 100.01
+        (100.01, 100.02, 0.9, 1),   # fill at 100.02: 1 tick of slippage
+        (100.03, 100.04, 0.9, 1),   # decide to sell at 100.03
+        (100.03, 100.04, 0.9, 1),   # fill at 100.03: no slippage
+    ])
+    stats = result["stats"]
+    assert stats["entry_slippage_ticks"] == pytest.approx(1.0)
+    assert stats["exit_slippage_ticks"] == pytest.approx(0.0)
+    assert stats["median_holding_ms"] == pytest.approx(2.0)
+
+
+def test_exchange_clock_and_book_lookup():
+    recv = np.array([10, 20, 30, 40])
+    event = np.array([5, 4, 25, 50])     # out of order, and one after its receive time
+    clock = exchange_clock(event, recv)
+    assert clock.tolist() == [5, 5, 25, 40]
+
+    tradable = np.array([0, 2, 3])       # record 1 is not tradable
+    assert book_at(clock, tradable, 7).item() == 1     # last record at 7 is 1 -> next tradable is 2
+    assert book_at(clock, tradable, 25).item() == 1    # record 2 itself
+    assert book_at(clock, tradable, 41).item() == 3    # after the last record: no book
+    assert book_at(clock, tradable, np.array([5, 30])).tolist() == [1, 1]
 
 
 def test_flatten_before_close_and_no_trading_in_break():
@@ -275,3 +473,9 @@ def test_invalid_config():
         BacktestConfig(max_spread_ticks=0.5)
     with pytest.raises(ValueError):
         BacktestConfig(min_top_depth=-1)
+    with pytest.raises(ValueError):
+        BacktestConfig(fill_model="instant")
+    with pytest.raises(ValueError):
+        BacktestConfig(order_latency_us=-1)
+    with pytest.raises(ValueError):
+        BacktestConfig(latency_jitter_us=-5)
