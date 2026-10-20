@@ -86,6 +86,8 @@ class BacktestConfig:
     routing_fee: float = 0.50
     latency_us: float = 0.0
     flatten_minutes: float = 1.0
+    max_spread_ticks: float | None = None
+    min_top_depth: int = 0
 
     def __post_init__(self) -> None:
         if self.symbol not in CONTRACT_SPECS:
@@ -98,6 +100,10 @@ class BacktestConfig:
             raise ValueError("quantity must be at least 1 contract.")
         if min(self.exchange_fee, self.routing_fee, self.latency_us, self.flatten_minutes) < 0:
             raise ValueError("Fees, latency and flatten_minutes cannot be negative.")
+        if self.max_spread_ticks is not None and self.max_spread_ticks < 1:
+            raise ValueError("max_spread_ticks must be at least 1 tick (or None to disable).")
+        if self.min_top_depth < 0:
+            raise ValueError("min_top_depth cannot be negative.")
 
     @property
     def multiplier(self) -> float:
@@ -210,11 +216,36 @@ def session_masks(ts_recv: pd.Series, flatten_minutes: float) -> tuple[np.ndarra
     return in_session, closing
 
 
+def tradable_events(market: pd.DataFrame, flatten_minutes: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return (indices of tradable book events, closing mask over all events).
+
+    An event is tradable when it completes an exchange packet, the book is
+    uncrossed with size on both sides, and it falls inside Globex hours.
+    """
+    bid = market["bid_px_00"].to_numpy(dtype=float)
+    ask = market["ask_px_00"].to_numpy(dtype=float)
+    valid_book = (
+        ((market["flags"].to_numpy() & F_LAST) > 0)
+        & np.isfinite(bid)
+        & np.isfinite(ask)
+        & (bid < ask)
+        & (market["bid_sz_00"].to_numpy() > 0)
+        & (market["ask_sz_00"].to_numpy() > 0)
+    )
+    in_session, closing = session_masks(market["ts_recv"], flatten_minutes)
+    return np.flatnonzero(valid_book & in_session), closing
+
+
 def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
     """Simulate the strategy over book events.
 
     ``market`` needs ``ts_recv, ts_event, bid_px_00, ask_px_00, bid_sz_00,
     ask_sz_00, flags, OBI, signal`` in receive-time order.
+
+    Entries can be restricted to tight spreads (``max_spread_ticks``) and to
+    books showing enough size at the touch (``min_top_depth`` contracts on
+    bid plus ask). An entry also needs the side it crosses to show at least
+    ``quantity`` contracts. Exits are never filtered.
     """
     required = {"ts_recv", "ts_event", "bid_px_00", "ask_px_00", "bid_sz_00", "ask_sz_00", "flags", "OBI", "signal"}
     missing = required - set(market.columns)
@@ -231,18 +262,12 @@ def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
     recv_ns = pd.DatetimeIndex(ts_recv).as_unit("ns").asi8
     ts_event = market["ts_event"].reset_index(drop=True)
 
-    valid_book = (
-        ((market["flags"].to_numpy() & F_LAST) > 0)
-        & np.isfinite(bid)
-        & np.isfinite(ask)
-        & (bid < ask)
-        & (market["bid_sz_00"].to_numpy() > 0)
-        & (market["ask_sz_00"].to_numpy() > 0)
-    )
-    in_session, closing = session_masks(ts_recv, config.flatten_minutes)
-    tradable = np.flatnonzero(valid_book & in_session)
+    bid_sz = market["bid_sz_00"].to_numpy(dtype=float)
+    ask_sz = market["ask_sz_00"].to_numpy(dtype=float)
+    tradable, closing = tradable_events(market, config.flatten_minutes)
 
     mid = (bid + ask) / 2
+    spread_ticks = (ask - bid) / config.tick_size
     portfolio = Portfolio(config.initial_cash, config.multiplier, config.fee_per_contract)
     tp_distance = config.take_profit_ticks * config.tick_size
     sl_distance = config.stop_loss_ticks * config.tick_size
@@ -254,7 +279,12 @@ def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
     entry_mid = 0.0
     equity_points: list[tuple] = []
     last_minute = None
-    counts = {"entries_cancelled": 0, "entries_blocked_no_equity": 0}
+    counts = {
+        "entries_cancelled": 0,
+        "entries_blocked_no_equity": 0,
+        "entries_skipped_spread": 0,
+        "entries_skipped_depth": 0,
+    }
 
     def record_equity(i: int) -> None:
         equity_points.append(
@@ -312,8 +342,13 @@ def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
             if reason is not None:
                 order = (-direction, abs(position), reason)
         elif signal[i] != 0 and not closing[i]:
+            crossed_size = ask_sz[i] if signal[i] > 0 else bid_sz[i]
             if portfolio.equity(bid[i], ask[i]) <= 0:
                 counts["entries_blocked_no_equity"] += 1
+            elif config.max_spread_ticks is not None and spread_ticks[i] > config.max_spread_ticks + 1e-6:
+                counts["entries_skipped_spread"] += 1
+            elif crossed_size < config.quantity or bid_sz[i] + ask_sz[i] < config.min_top_depth:
+                counts["entries_skipped_depth"] += 1
             else:
                 order = (int(signal[i]), config.quantity, "entry_long" if signal[i] > 0 else "entry_short")
 
@@ -382,6 +417,8 @@ def summarize(
         "exit_reasons": exits["reason"].value_counts().to_dict() if len(exits) else {},
         "entries_cancelled": counts["entries_cancelled"],
         "entries_blocked_no_equity": counts["entries_blocked_no_equity"],
+        "entries_skipped_spread": counts["entries_skipped_spread"],
+        "entries_skipped_depth": counts["entries_skipped_depth"],
         "gross_pnl": portfolio.realized_pnl,
         "fees": portfolio.fees_paid,
         "net_pnl": portfolio.cash - portfolio.initial_cash,
@@ -402,6 +439,9 @@ def format_stats(stats: dict, config: BacktestConfig) -> str:
         f"Exit reasons:       {stats['exit_reasons']}",
         f"Entries cancelled at close: {stats['entries_cancelled']}",
         f"Entry signals skipped (equity <= 0): {stats['entries_blocked_no_equity']:,}",
+        f"Entry signals skipped (spread > {config.max_spread_ticks} ticks): {stats['entries_skipped_spread']:,}",
+        f"Entry signals skipped (thin book, depth < {config.min_top_depth} or size < {config.quantity}): "
+        f"{stats['entries_skipped_depth']:,}",
         f"Gross PnL:          ${stats['gross_pnl']:,.2f}",
         f"Fees:               ${stats['fees']:,.2f}",
         f"Net PnL:            ${stats['net_pnl']:,.2f}",
@@ -469,6 +509,10 @@ def parse_args() -> argparse.Namespace:
                         help="Broker routing fee per contract per side (default: %(default)s).")
     parser.add_argument("--latency_us", type=float, default=0.0,
                         help="Extra delay before an order can fill; it always fills on a later event.")
+    parser.add_argument("--max_spread_ticks", type=float, default=None,
+                        help="Only enter when the bid-ask spread is at most this many ticks (default: no limit).")
+    parser.add_argument("--min_top_depth", type=int, default=0,
+                        help="Only enter when best bid size plus best ask size is at least this many contracts.")
     parser.add_argument("--flatten_minutes", type=float, default=1.0,
                         help="Flatten and stop entering this many minutes before the 16:00 CT close.")
     parser.add_argument("--levels", type=int, nargs="+", default=order_book_imbalance.DEFAULT_LEVELS)
@@ -492,6 +536,8 @@ def main() -> None:
         routing_fee=args.routing_fee,
         latency_us=args.latency_us,
         flatten_minutes=args.flatten_minutes,
+        max_spread_ticks=args.max_spread_ticks,
+        min_top_depth=args.min_top_depth,
     )
     signal_files = ensure_signal_files(
         config.symbol, config.imbalance_threshold, args.levels,

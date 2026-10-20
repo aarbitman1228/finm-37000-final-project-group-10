@@ -75,6 +75,7 @@ This is a limited, exploratory in-sample sensitivity check on one contract and f
 * **Trading hours:** no trading during the CME 16:00–17:00 CT maintenance break or the weekend; positions are flattened and entries stop 1 minute before the 16:00 CT close. Any position left at the end of the data is closed at the last quote.
 * **Portfolio:** starts with $100,000. As with futures, cash changes only by realized PnL and fees; equity also includes open-position PnL marked at the bid (long) or ask (short). New entries stop once equity reaches zero.
 * **Fees:** $1.50 CME exchange fee plus $0.50 routing fee per contract per fill (`--exchange_fee`, `--routing_fee`). These are approximate and configurable.
+* **Spread and size filters (optional):** `--max_spread_ticks N` skips entries when the bid-ask spread is wider than N ticks, and `--min_top_depth N` skips entries when best bid size plus best ask size is below N contracts. An entry also needs the side it crosses to show at least `--quantity` contracts. Exits are never filtered. MBP-10 data does not separate implied (spread-derived) orders, so "size" here means the displayed size at the touch.
 
 Other options include `--stop_loss_ticks`, `--quantity`, `--latency_us` (extra order delay) and `--flatten_minutes`. The trade log columns `ts_event, side, price, quantity, fee` are the input format for the reporting module.
 
@@ -97,6 +98,8 @@ Other options include `--stop_loss_ticks`, `--quantity`, `--latency_us` (extra o
    The reporting module reads the backtester output (`results/trade_log.csv` and, if present, `results/equity_curve.csv`):
    `python src/reporting.py --symbol CL --imbalance_threshold 0.75`
    This writes `results_summary.txt` (net PnL, win rate, trade count, max drawdown, plus a cross-check against the engine's `realized_pnl`), `visualizations/equity_curve.png`, and `visualizations/price_and_obi.png`. Use `--trades` / `--equity` to point at other files, and run the tests with `pytest tests/`.
+9. **Analyze Spread and Size:**
+   Run `python src/spread_size_analysis.py --symbol CL` to measure, for every signal, how far the mid price moves in the signal's direction after 0.1, 1 and 10 seconds (`--horizons_ms`) against the cost of crossing the spread in and out plus fees, grouped by spread and by size at the touch. It writes `results/spread_size_analysis.csv` and `visualizations/spread_size_analysis.png`. Compare runs of `backtester.py` with and without `--max_spread_ticks` / `--min_top_depth` to see the effect on PnL.
 
 ## Team Agreement
 
