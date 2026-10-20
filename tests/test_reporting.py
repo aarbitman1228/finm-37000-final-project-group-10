@@ -186,6 +186,28 @@ def test_engine_csv_roundtrip_and_equity_curve(tmp_path):
     assert metrics["max_drawdown"] == pytest.approx(506.0)
 
 
+def test_csv_timestamps_on_a_whole_second_are_parsed(tmp_path):
+    # pandas writes "2026-10-05 00:00:00+00:00" for a whole second and adds a
+    # fraction otherwise; the engine's midnight snapshot row produces the first.
+    (tmp_path / "trade_log.csv").write_text(
+        "ts_event,side,price,quantity,fee\n"
+        "2026-10-05 00:00:00.000050123+00:00,BUY,70.00,1,2.0\n"
+        "2026-10-05 00:00:01+00:00,SELL,70.01,1,2.0\n"
+    )
+    (tmp_path / "equity_curve.csv").write_text(
+        "ts_recv,position,cash,equity\n"
+        "2026-10-05 00:00:00.000050123+00:00,1,99998.0,99998.0\n"
+        "2026-10-05 00:00:01+00:00,0,100006.0,100006.0\n"
+    )
+    metrics = reporting.compute_metrics(
+        reporting.load_trades(tmp_path / "trade_log.csv"),
+        multiplier=1000.0,
+        equity_curve=reporting.load_trades(tmp_path / "equity_curve.csv"),
+    )
+    assert metrics["total_net_pnl"] == pytest.approx(6.0)
+    assert metrics["equity_curve"]["ts_event"].iloc[0] == pd.Timestamp("2026-10-05 00:00:00.000050123", tz="UTC")
+
+
 def test_engine_gross_pnl_cross_check():
     log, _ = make_engine_log()
     metrics = reporting.compute_metrics(log, multiplier=1000.0)
