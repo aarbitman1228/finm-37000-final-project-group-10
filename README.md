@@ -3,7 +3,7 @@
 ## Project Goal
 The goal of this project is to develop an event-driven backtesting engine in Python that executes a micro-momentum trading strategy based on Order Book Imbalance (OBI) in commodity futures. 
 
-Instead of relying on lagging indicators from executed trades, this project utilizes Level 2 order book depth to predict short-term price movements. By analyzing the ratio of limit buy orders (bids) to limit sell orders (asks) resting in the book, the algorithm identifies severe liquidity imbalances. When the imbalance crosses a critical threshold, the strategy executes a momentum trade to capture a small tick-level profit before the book neutralizes. 
+Instead of relying on lagging indicators from executed trades, this project utilizes Level 2 order book depth to test whether the ratio of limit buy orders (bids) to limit sell orders (asks) resting in the book predicts short-term price movements. The current signal cutoff is a provisional heuristic, not an empirically established critical threshold. The strategy tests whether trades entered after an imbalance can capture a small tick-level profit before the book neutralizes.
 
 ## Data Source
 *   **Provider:** Databento
@@ -36,7 +36,32 @@ Trading signals are generated based on the calculated OBI using a configurable t
 * **SELL (-1):** OBI < -0.75
 * **NEUTRAL (0):** Otherwise.
 
+The default of 0.75 is a provisional, a priori choice; it has not been established as a statistically or economically meaningful cutoff. See [Critical Threshold Validation](#critical-threshold-validation) for the available sample analysis.
+
 The script processes OBI data from `data/processed/` and saves the resulting signals in `data/signals/`. Previously generated files are reused when available.
+
+## Critical Threshold Validation
+
+**Conclusion:** The current sample does not empirically support 0.75 as a profitable critical threshold, and it does not establish another cutoff as suitable. The default remains unchanged as a configurable research baseline; it must not be interpreted as a validated trading parameter.
+
+### Sample and method
+
+The sensitivity check used the five full CL MBP-10 files for UTC dates October 5–10, 2026 (12,813,597 book events in total). The shorter October 4 file was excluded. OBI was calculated at level 0, as in the default configuration. Each daily file was backtested independently at thresholds 0.75, 0.85, 0.90, and 0.95 using the default one-contract size, two-tick take-profit and stop-loss, $2.00 per-contract-per-side fees, trading-hour/book-quality filters, and $100,000 initial cash. Each run starts with fresh cash and liquidates any remaining position at that file's end; the daily net PnL figures below are summed, not compounded. Positive round-trip PnL defines a win.
+
+### Results
+
+The detailed reproducible output is in [`threshold_optimization/`](threshold_optimization/): per-day metrics in [`daily_results.csv`](threshold_optimization/daily_results.csv), aggregate comparisons in [`threshold_summary.csv`](threshold_optimization/threshold_summary.csv), and rerun instructions in that folder's README.
+
+| OBI threshold | Round trips | Winning trades | Gross PnL | Fees | Net PnL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.75 | 30,418 | 45 (0.15%) | -$378,360 | $121,672 | -$500,032 |
+| 0.85 | 10,710 | 27 (0.25%) | -$113,700 | $42,840 | -$156,540 |
+| 0.90 | 3,495 | 10 (0.29%) | -$35,430 | $13,980 | -$49,410 |
+| 0.95 | 761 | 5 (0.66%) | -$8,520 | $3,044 | -$11,564 |
+
+Every threshold lost money on every daily file. At 0.75, each daily run reached the equity stop that prevents new entries. Raising the cutoff reduced the number of trades and therefore the fees and losses, but even 0.95 lost money on all five files and produced only five winning round trips. This is evidence against treating 0.75 as a validated profitability threshold; the smaller loss at 0.95 is not evidence that 0.95 is a good threshold.
+
+This is a limited, exploratory in-sample sensitivity check on one contract and five dates, not a holdout test or a statistical significance analysis. The results do not justify tuning the default to 0.95 (or any other tested value). Before selecting a production cutoff, evaluate additional periods and instruments, use a time-separated holdout, and account for selection bias and realistic execution costs.
 
 
 ## Backtest Execution Engine
