@@ -215,8 +215,63 @@ def test_portfolio_add_flip_and_mark_to_market():
     assert p.equity(bid=100.03, ask=100.04) == pytest.approx(100_000 + 80 - 10 + 10)
 
 
+def test_spread_filter_skips_wide_entries():
+    rows = [
+        (100.00, 100.02, 0.9, 1),   # 2-tick spread: too wide
+        (100.00, 100.02, 0.9, 1),
+        (100.00, 100.02, 0.9, 1),
+    ]
+    filtered = run(rows, max_spread_ticks=1)
+    assert filtered["trades"].empty
+    assert filtered["stats"]["entries_skipped_spread"] == 3
+
+    unfiltered = run(rows, max_spread_ticks=2)
+    assert not unfiltered["trades"].empty
+    assert unfiltered["stats"]["entries_skipped_spread"] == 0
+
+
+def test_spread_filter_never_blocks_exits():
+    result = run(
+        [
+            (100.00, 100.01, 0.9, 1),
+            (100.00, 100.01, 0.9, 1),    # entry fills at 100.01
+            (100.00, 100.03, -0.1, 0),   # spread widens and OBI crosses 0: exit anyway
+            (100.00, 100.03, -0.1, 0),
+        ],
+        max_spread_ticks=1,
+    )
+    assert list(result["trades"]["reason"]) == ["entry_long", "obi_neutral"]
+
+
+def test_depth_filter_skips_thin_books():
+    market = make_market([(100.00, 100.01, 0.9, 1)] * 3)
+    market[["bid_sz_00", "ask_sz_00"]] = 2   # 4 contracts at the touch
+
+    thin = run_backtest(market, BacktestConfig(min_top_depth=5))
+    assert thin["trades"].empty
+    assert thin["stats"]["entries_skipped_depth"] == 3
+
+    enough = run_backtest(market, BacktestConfig(min_top_depth=4))
+    assert not enough["trades"].empty
+
+
+def test_entry_needs_displayed_size_for_quantity():
+    market = make_market([(100.00, 100.01, 0.9, 1)] * 3)
+    market["ask_sz_00"] = 2     # a buy of 3 contracts cannot be filled at the touch
+
+    result = run_backtest(market, BacktestConfig(quantity=3))
+    assert result["trades"].empty
+    assert result["stats"]["entries_skipped_depth"] == 3
+
+    assert not run_backtest(market, BacktestConfig(quantity=2))["trades"].empty
+
+
 def test_invalid_config():
     with pytest.raises(ValueError):
         BacktestConfig(symbol="NG")
     with pytest.raises(ValueError):
         BacktestConfig(imbalance_threshold=1.5)
+    with pytest.raises(ValueError):
+        BacktestConfig(max_spread_ticks=0.5)
+    with pytest.raises(ValueError):
+        BacktestConfig(min_top_depth=-1)
