@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=DEFAULT_THRESHOLDS,
     )
+    parser.add_argument(
+        "--fill-model",
+        choices=backtester.FILL_MODELS,
+        default="latency",
+        help="Backtester execution model; the committed results used next_event.",
+    )
     return parser.parse_args()
 
 
@@ -78,7 +84,7 @@ def _start_date(file: Path) -> str:
     return date.fromisoformat(file.stem.split("_")[-2]).isoformat()
 
 
-def analyze_file(file: Path, thresholds: list[float]) -> list[dict]:
+def analyze_file(file: Path, thresholds: list[float], fill_model: str = "latency") -> list[dict]:
     """Backtest one daily file independently at each requested threshold."""
     market = pd.read_parquet(file, columns=MARKET_COLUMNS).reset_index()
     market["OBI"] = order_book_imbalance.get_OBI(
@@ -96,7 +102,7 @@ def analyze_file(file: Path, thresholds: list[float]) -> list[dict]:
         backtest_market["signal"] = signals["signal"].to_numpy()
         outcome = backtester.run_backtest(
             backtest_market,
-            backtester.BacktestConfig(imbalance_threshold=threshold),
+            backtester.BacktestConfig(imbalance_threshold=threshold, fill_model=fill_model),
         )
         stats = outcome["stats"]
         results.append(
@@ -157,7 +163,7 @@ def main() -> None:
     daily_results = pd.DataFrame(
         row
         for file in files
-        for row in analyze_file(file, args.thresholds)
+        for row in analyze_file(file, args.thresholds, args.fill_model)
     )
     summary = summarize_results(daily_results)
 

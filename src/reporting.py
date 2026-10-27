@@ -88,7 +88,8 @@ def normalize_trades(trades: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Trade log is missing required columns: {sorted(missing)}")
 
     out = pd.DataFrame(index=trades.index)
-    out["ts_event"] = pd.to_datetime(trades["ts_event"], utc=True)
+    # ISO8601: CSV timestamps on a whole second are written without a fraction.
+    out["ts_event"] = pd.to_datetime(trades["ts_event"], utc=True, format="ISO8601")
     out["price"] = trades["price"].astype(float)
 
     side = trades["side"]
@@ -214,7 +215,7 @@ def normalize_equity_curve(equity_curve: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame(
         {
-            "ts_event": pd.to_datetime(equity_curve[time_col], utc=True),
+            "ts_event": pd.to_datetime(equity_curve[time_col], utc=True, format="ISO8601"),
             "equity": equity_curve["equity"].astype(float),
         }
     )

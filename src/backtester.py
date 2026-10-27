@@ -7,14 +7,33 @@ simulates trading on the signals produced by ``trading_signals.py``:
 * Exit: take-profit or stop-loss measured in ticks of mid-price movement
   since entry, or the OBI crossing back through 0.
 * New entries stop once account equity is at or below zero.
-* Execution: a decision made on one book event is filled on the next valid
-  event (no fill at the quote that generated the signal). Buys pay
-  ``ask_px_00`` and sells receive ``bid_px_00``.
+* Execution: messages between the exchange and the strategy take time (see
+  below). Buys pay ``ask_px_00`` and sells receive ``bid_px_00`` of the book
+  the order executes against.
 * Only events that complete an exchange packet (``F_LAST`` flag) with an
   uncrossed book are used, so halts and pre-open auctions are not traded.
 * No trading during the CME daily maintenance break or the weekend; open
   positions are flattened shortly before the 16:00 CT close.
 * Every fill pays a per-contract exchange fee and routing fee.
+
+Latency model (``fill_model="latency"``, the default)
+-----------------------------------------------------
+Every record carries two clocks: ``ts_event``, when CME's matching engine
+processed the event, and ``ts_recv``, when Databento's capture server in the
+CME data center received it. The strategy
+
+1. sees a book event ``feed_latency_us`` after ``ts_recv``;
+2. sends an order that reaches the matching engine ``order_latency_us`` after
+   the decision. It executes against the book as it stands at that moment in
+   exchange time: the last event with ``ts_event`` at or before the arrival,
+   which may be one the strategy has not received yet;
+3. receives the fill report ``response_latency_us`` after the execution, and
+   only then acts on its new position, using the newest book it has seen.
+
+``latency_jitter_us`` adds a random exponential delay with this mean to every
+order and fill report. ``fill_model="next_event"`` keeps the original
+approximation: an order fills on the next book event Databento received, and
+the strategy knows about the fill at once.
 
 Outputs a trade log (one row per fill) and a mark-to-market equity curve in
 ``results/``. The trade log columns ``ts_event, side, price, quantity, fee``
@@ -56,6 +75,8 @@ EXCHANGE_TZ = "America/Chicago"
 SESSION_CLOSE_MINUTE = 16 * 60
 SESSION_OPEN_MINUTE = 17 * 60
 
+FILL_MODELS = ("latency", "next_event")
+
 TRADE_LOG_COLUMNS = [
     "ts_event",
     "ts_recv",
@@ -68,6 +89,8 @@ TRADE_LOG_COLUMNS = [
     "ask_px_00",
     "OBI",
     "decision_ts_recv",
+    "decision_price",
+    "ts_sent",
     "position_after",
     "realized_pnl",
     "cash_after",
@@ -84,7 +107,14 @@ class BacktestConfig:
     initial_cash: float = 100_000.0
     exchange_fee: float = 1.50
     routing_fee: float = 0.50
-    latency_us: float = 0.0
+    fill_model: str = "latency"
+    # One-way delays in microseconds. The defaults are a software strategy
+    # colocated with CME in Aurora, where Databento also captures the data.
+    feed_latency_us: float = 0.0
+    order_latency_us: float = 50.0
+    response_latency_us: float = 50.0
+    latency_jitter_us: float = 0.0
+    seed: int = 0
     flatten_minutes: float = 1.0
     max_spread_ticks: float | None = None
     min_top_depth: int = 0
@@ -98,8 +128,11 @@ class BacktestConfig:
             raise ValueError("take_profit_ticks and stop_loss_ticks must be positive.")
         if self.quantity < 1:
             raise ValueError("quantity must be at least 1 contract.")
-        if min(self.exchange_fee, self.routing_fee, self.latency_us, self.flatten_minutes) < 0:
-            raise ValueError("Fees, latency and flatten_minutes cannot be negative.")
+        if self.fill_model not in FILL_MODELS:
+            raise ValueError(f"fill_model must be one of {FILL_MODELS}.")
+        latencies = (self.feed_latency_us, self.order_latency_us, self.response_latency_us, self.latency_jitter_us)
+        if min(self.exchange_fee, self.routing_fee, self.flatten_minutes, *latencies) < 0:
+            raise ValueError("Fees, latencies and flatten_minutes cannot be negative.")
         if self.max_spread_ticks is not None and self.max_spread_ticks < 1:
             raise ValueError("max_spread_ticks must be at least 1 tick (or None to disable).")
         if self.min_top_depth < 0:
@@ -236,6 +269,29 @@ def tradable_events(market: pd.DataFrame, flatten_minutes: float) -> tuple[np.nd
     return np.flatnonzero(valid_book & in_session), closing
 
 
+def exchange_clock(event_ns: np.ndarray, recv_ns: np.ndarray) -> np.ndarray:
+    """Exchange time of each record, sorted so the book can be looked up by time.
+
+    ``ts_event`` is made non-decreasing and capped at ``ts_recv``, since an
+    event cannot happen after Databento received it.
+    """
+    return np.minimum(np.maximum.accumulate(event_ns), recv_ns)
+
+
+def book_at(exchange_ns: np.ndarray, tradable: np.ndarray, arrival_ns):
+    """Position in ``tradable`` of the book an order reaching the exchange at
+    ``arrival_ns`` executes against.
+
+    That is the last record at or before the arrival or, if that book is not
+    tradable (crossed, mid-packet or outside trading hours), the next tradable
+    one. Returns ``len(tradable)`` when there is none or the arrival is after
+    the last record, where the book is unknown. Accepts scalars or arrays.
+    """
+    last = np.searchsorted(exchange_ns, arrival_ns, side="right") - 1
+    position = np.searchsorted(tradable, last)
+    return np.where(arrival_ns > exchange_ns[-1], len(tradable), position)
+
+
 def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
     """Simulate the strategy over book events.
 
@@ -246,6 +302,10 @@ def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
     books showing enough size at the touch (``min_top_depth`` contracts on
     bid plus ask). An entry also needs the side it crosses to show at least
     ``quantity`` contracts. Exits are never filtered.
+
+    The strategy has at most one order working: after sending one it waits
+    for the fill report, then decides on the newest book it has seen. Book
+    events seen while waiting are not evaluated one by one.
     """
     required = {"ts_recv", "ts_event", "bid_px_00", "ask_px_00", "bid_sz_00", "ask_sz_00", "flags", "OBI", "signal"}
     missing = required - set(market.columns)
@@ -258,9 +318,8 @@ def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
     ask = market["ask_px_00"].to_numpy(dtype=float)
     obi = market["OBI"].to_numpy(dtype=float)
     signal = market["signal"].to_numpy()
-    ts_recv = market["ts_recv"]
-    recv_ns = pd.DatetimeIndex(ts_recv).as_unit("ns").asi8
-    ts_event = market["ts_event"].reset_index(drop=True)
+    recv_ns = pd.DatetimeIndex(market["ts_recv"]).as_unit("ns").asi8
+    event_ns = pd.DatetimeIndex(market["ts_event"]).as_unit("ns").asi8
 
     bid_sz = market["bid_sz_00"].to_numpy(dtype=float)
     ask_sz = market["ask_sz_00"].to_numpy(dtype=float)
@@ -273,10 +332,17 @@ def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
     sl_distance = config.stop_loss_ticks * config.tick_size
     # Float tolerance so prices exactly on the target tick level trigger.
     eps = config.tick_size * 1e-6
-    latency_ns = int(config.latency_us * 1_000)
+
+    latency_model = config.fill_model == "latency"
+    exchange_ns = exchange_clock(event_ns, recv_ns)
+    # When the strategy sees each event; the next-event approximation has no delays.
+    seen_ns = recv_ns + (round(config.feed_latency_us * 1_000) if latency_model else 0)
+    tradable_recv_ns = recv_ns[tradable]
+    rng = np.random.default_rng(config.seed)
 
     pending: dict | None = None
     entry_mid = 0.0
+    seen = evaluated = -1
     equity_points: list[tuple] = []
     last_minute = None
     counts = {
@@ -286,44 +352,36 @@ def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
         "entries_skipped_depth": 0,
     }
 
-    def record_equity(i: int) -> None:
-        equity_points.append(
-            (ts_recv.iat[i], portfolio.position, portfolio.cash, portfolio.equity(bid[i], ask[i]))
-        )
+    def record_equity(ts_ns: int, i: int) -> None:
+        equity_points.append((ts_ns, portfolio.position, portfolio.cash, portfolio.equity(bid[i], ask[i])))
 
-    for i in tradable:
-        if pending is not None and recv_ns[i] >= pending["earliest_ns"]:
-            if pending["is_entry"] and closing[i]:
-                counts["entries_cancelled"] += 1
-            else:
-                side = pending["side"]
-                portfolio.fill(
-                    side,
-                    pending["quantity"],
-                    ask[i] if side > 0 else bid[i],
-                    ts_event=ts_event.iat[i],
-                    ts_recv=ts_recv.iat[i],
-                    reason=pending["reason"],
-                    bid_px_00=bid[i],
-                    ask_px_00=ask[i],
-                    OBI=obi[i],
-                    decision_ts_recv=pending["decision_ts_recv"],
-                )
-                if pending["is_entry"]:
-                    entry_mid = mid[i]
-                record_equity(i)
-            pending = None
+    def delay_ns(latency_us: float) -> int:
+        """One message delay, plus random jitter when configured."""
+        if config.latency_jitter_us > 0:
+            latency_us += rng.exponential(config.latency_jitter_us)
+        return round(latency_us * 1_000)
 
-        minute = recv_ns[i] // 60_000_000_000
-        if minute != last_minute:
-            record_equity(i)
-            last_minute = minute
+    def route(i: int, sent_ns: int) -> tuple[int, int, int] | None:
+        """(book record filled against, exchange fill time, fill report time) of an
+        order decided on record ``i`` and sent at ``sent_ns``; None if it never fills."""
+        if latency_model:
+            arrival_ns = sent_ns + delay_ns(config.order_latency_us)
+            position = int(book_at(exchange_ns, tradable, arrival_ns))
+            if position == len(tradable):
+                return None
+            j = tradable[position]
+            # If the book was not tradable on arrival, the order waits for the next valid book.
+            fill_ns = max(arrival_ns, int(exchange_ns[j]))
+            return j, fill_ns, fill_ns + delay_ns(config.response_latency_us)
+        position = int(np.searchsorted(tradable_recv_ns, recv_ns[i] + 1))
+        if position == len(tradable):
+            return None
+        j = tradable[position]
+        return j, int(event_ns[j]), int(recv_ns[j])
 
-        if pending is not None:
-            continue
-
+    def decide(i: int, now_ns: int) -> dict | None:
+        """Apply the exit or entry rules to book record ``i`` and return the order sent, if any."""
         position = portfolio.position
-        order = None
         if position != 0:
             # Take-profit / stop-loss compare mid to mid, so the spread paid on
             # entry does not trigger the stop on its own; fills still cross the spread.
@@ -338,50 +396,119 @@ def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
             elif obi[i] * direction <= 0:
                 reason = "obi_neutral"
             else:
-                reason = None
-            if reason is not None:
-                order = (-direction, abs(position), reason)
+                return None
+            side, quantity = -direction, abs(position)
         elif signal[i] != 0 and not closing[i]:
             crossed_size = ask_sz[i] if signal[i] > 0 else bid_sz[i]
             if portfolio.equity(bid[i], ask[i]) <= 0:
                 counts["entries_blocked_no_equity"] += 1
-            elif config.max_spread_ticks is not None and spread_ticks[i] > config.max_spread_ticks + 1e-6:
+                return None
+            if config.max_spread_ticks is not None and spread_ticks[i] > config.max_spread_ticks + 1e-6:
                 counts["entries_skipped_spread"] += 1
-            elif crossed_size < config.quantity or bid_sz[i] + ask_sz[i] < config.min_top_depth:
+                return None
+            if crossed_size < config.quantity or bid_sz[i] + ask_sz[i] < config.min_top_depth:
                 counts["entries_skipped_depth"] += 1
-            else:
-                order = (int(signal[i]), config.quantity, "entry_long" if signal[i] > 0 else "entry_short")
+                return None
+            side, quantity = int(signal[i]), config.quantity
+            reason = "entry_long" if side > 0 else "entry_short"
+        else:
+            return None
 
-        if order is not None:
-            pending = {
-                "side": order[0],
-                "quantity": order[1],
-                "reason": order[2],
-                "is_entry": position == 0,
-                "earliest_ns": recv_ns[i] + max(latency_ns, 1),
-                "decision_ts_recv": ts_recv.iat[i],
-            }
+        fill = route(i, now_ns)
+        return {
+            "side": side,
+            "quantity": quantity,
+            "reason": reason,
+            "is_entry": position == 0,
+            "decision": i,
+            "decision_price": ask[i] if side > 0 else bid[i],
+            "sent_ns": now_ns,
+            "fill": fill,
+            "report_ns": np.inf if fill is None else fill[2],
+        }
+
+    def complete(order: dict) -> bool:
+        """Apply an executed order to the portfolio. An entry that reaches the
+        exchange in the flatten window is dropped instead; returns whether it filled."""
+        nonlocal entry_mid
+        j, fill_ns, report_ns = order["fill"]
+        if order["is_entry"] and closing[j]:
+            counts["entries_cancelled"] += 1
+            return False
+        side = order["side"]
+        portfolio.fill(
+            side,
+            order["quantity"],
+            ask[j] if side > 0 else bid[j],
+            ts_event=fill_ns,
+            ts_recv=report_ns,
+            reason=order["reason"],
+            bid_px_00=bid[j],
+            ask_px_00=ask[j],
+            OBI=obi[j],
+            decision_ts_recv=recv_ns[order["decision"]],
+            decision_price=order["decision_price"],
+            ts_sent=order["sent_ns"],
+        )
+        if order["is_entry"]:
+            entry_mid = mid[j]
+        return True
+
+    for i in tradable:
+        now_ns = seen_ns[i]
+        # Fill reports that reach the strategy before it sees this event.
+        while pending is not None and pending["report_ns"] <= now_ns:
+            order, pending = pending, None
+            j, _, report_ns = order["fill"]
+            if complete(order):
+                record_equity(report_ns, j)
+            # React to the report using the newest book seen, unless that book was
+            # already evaluated. The next-event approximation decides on the fill event.
+            if latency_model and seen > evaluated:
+                evaluated = seen
+                pending = decide(seen, report_ns)
+        seen = i
+
+        minute = now_ns // 60_000_000_000
+        if minute != last_minute:
+            record_equity(now_ns, i)
+            last_minute = minute
+
+        if pending is None:
+            evaluated = i
+            if portfolio.position != 0 or signal[i] != 0:
+                pending = decide(i, now_ns)
+
+    if pending is not None and pending["fill"] is not None:
+        # Executed at the exchange, but the fill report arrives after the data ends.
+        complete(pending)
 
     if len(tradable):
         last = tradable[-1]
         if portfolio.position != 0:
             side = -int(np.sign(portfolio.position))
+            price = ask[last] if side > 0 else bid[last]
             portfolio.fill(
                 side,
                 abs(portfolio.position),
-                ask[last] if side > 0 else bid[last],
-                ts_event=ts_event.iat[last],
-                ts_recv=ts_recv.iat[last],
+                price,
+                ts_event=max(int(event_ns[last]), int(portfolio.fills[-1]["ts_event"])),
+                ts_recv=recv_ns[last],
                 reason="end_of_data",
                 bid_px_00=bid[last],
                 ask_px_00=ask[last],
                 OBI=obi[last],
-                decision_ts_recv=ts_recv.iat[last],
+                decision_ts_recv=recv_ns[last],
+                decision_price=price,
+                ts_sent=recv_ns[last],
             )
-        record_equity(last)
+        record_equity(seen_ns[last], last)
 
     trades = pd.DataFrame(portfolio.fills, columns=TRADE_LOG_COLUMNS)
+    for column in ("ts_event", "ts_recv", "decision_ts_recv", "ts_sent"):
+        trades[column] = pd.to_datetime(trades[column], utc=True)
     equity_curve = pd.DataFrame(equity_points, columns=["ts_recv", "position", "cash", "equity"])
+    equity_curve["ts_recv"] = pd.to_datetime(equity_curve["ts_recv"], utc=True)
     equity_curve = equity_curve.drop_duplicates("ts_recv", keep="last").reset_index(drop=True)
 
     return {
@@ -389,6 +516,32 @@ def run_backtest(market: pd.DataFrame, config: BacktestConfig) -> dict:
         "equity_curve": equity_curve,
         "portfolio": portfolio,
         "stats": summarize(trades, equity_curve, portfolio, config, len(market), len(tradable), counts),
+    }
+
+
+def trade_stats(trades: pd.DataFrame, tick_size: float) -> dict:
+    """Round-trip, slippage and holding-time statistics of a trade log.
+
+    Slippage is the price paid relative to the quote the strategy saw when it
+    decided (ask for buys, bid for sells), in ticks; positive means worse.
+    """
+    # Fills alternate entry, exit, so each exit's entry is on the previous row.
+    is_exit = trades["position_after"] == 0
+    exits = trades[is_exit]
+    entries = trades.shift(1)[is_exit]
+    round_trip_pnl = exits["realized_pnl"] - exits["fee"] - entries["fee"]
+    holding = exits["ts_event"] - entries["ts_event"]
+
+    direction = np.where(trades["side"] == "BUY", 1.0, -1.0)
+    slippage = direction * (trades["price"] - trades["decision_price"]) / tick_size
+    traded_exit = is_exit & (trades["reason"] != "end_of_data")
+    return {
+        "round_trips": len(exits),
+        "wins": int((round_trip_pnl > 0).sum()),
+        "exit_reasons": exits["reason"].value_counts().to_dict() if len(exits) else {},
+        "entry_slippage_ticks": float(slippage[~is_exit].mean()) if (~is_exit).any() else float("nan"),
+        "exit_slippage_ticks": float(slippage[traded_exit].mean()) if traded_exit.any() else float("nan"),
+        "median_holding_ms": float(holding.median() / pd.Timedelta(milliseconds=1)) if len(exits) else float("nan"),
     }
 
 
@@ -401,20 +554,13 @@ def summarize(
     n_tradable: int,
     counts: dict,
 ) -> dict:
-    # Fills alternate entry, exit, so each exit's entry fee is on the previous row.
-    is_exit = trades["position_after"] == 0
-    exits = trades[is_exit]
-    entry_fees = trades["fee"].shift(1)[is_exit]
-    round_trip_pnl = exits["realized_pnl"] - exits["fee"] - entry_fees
     equity = equity_curve["equity"]
     drawdown = (equity.cummax() - equity).max() if len(equity) else 0.0
     return {
         "events": n_events,
         "tradable_events": n_tradable,
         "fills": len(trades),
-        "round_trips": len(exits),
-        "wins": int((round_trip_pnl > 0).sum()),
-        "exit_reasons": exits["reason"].value_counts().to_dict() if len(exits) else {},
+        **trade_stats(trades, config.tick_size),
         "entries_cancelled": counts["entries_cancelled"],
         "entries_blocked_no_equity": counts["entries_blocked_no_equity"],
         "entries_skipped_spread": counts["entries_skipped_spread"],
@@ -427,16 +573,29 @@ def summarize(
     }
 
 
+def describe_execution(config: BacktestConfig) -> str:
+    if config.fill_model == "next_event":
+        return "next-event approximation (fills on the next book event received)"
+    return (
+        f"latency model - feed +{config.feed_latency_us:g} us, order {config.order_latency_us:g} us, "
+        f"fill report {config.response_latency_us:g} us, jitter {config.latency_jitter_us:g} us"
+    )
+
+
 def format_stats(stats: dict, config: BacktestConfig) -> str:
     win_rate = stats["wins"] / stats["round_trips"] if stats["round_trips"] else float("nan")
     lines = [
         f"Backtest - {config.symbol}, OBI threshold {config.imbalance_threshold}, "
         f"TP {config.take_profit_ticks:g} / SL {config.stop_loss_ticks:g} ticks, "
         f"{config.quantity} contract(s), fees ${config.fee_per_contract:.2f}/contract/side",
+        f"Execution:          {describe_execution(config)}",
         f"Book events:        {stats['events']:,} ({stats['tradable_events']:,} tradable)",
         f"Fills:              {stats['fills']:,}",
         f"Round trips:        {stats['round_trips']:,} (win rate {win_rate:.2%})",
         f"Exit reasons:       {stats['exit_reasons']}",
+        f"Median holding:     {stats['median_holding_ms']:,.3f} ms",
+        f"Slippage vs. quote at decision: entries {stats['entry_slippage_ticks']:.3f} ticks, "
+        f"exits {stats['exit_slippage_ticks']:.3f} ticks",
         f"Entries cancelled at close: {stats['entries_cancelled']}",
         f"Entry signals skipped (equity <= 0): {stats['entries_blocked_no_equity']:,}",
         f"Entry signals skipped (spread > {config.max_spread_ticks} ticks): {stats['entries_skipped_spread']:,}",
@@ -507,8 +666,21 @@ def parse_args() -> argparse.Namespace:
                         help="CME exchange + clearing fee per contract per side (default: %(default)s).")
     parser.add_argument("--routing_fee", type=float, default=0.50,
                         help="Broker routing fee per contract per side (default: %(default)s).")
-    parser.add_argument("--latency_us", type=float, default=0.0,
-                        help="Extra delay before an order can fill; it always fills on a later event.")
+    parser.add_argument("--fill_model", choices=FILL_MODELS, default="latency",
+                        help="'latency' models message delays; 'next_event' is the original "
+                             "approximation (default: %(default)s).")
+    parser.add_argument("--feed_latency_us", type=float, default=0.0,
+                        help="Delay from Databento's receive time until the strategy sees an event "
+                             "(default: %(default)s).")
+    parser.add_argument("--order_latency_us", type=float, default=50.0,
+                        help="Delay from a decision until the order reaches the matching engine "
+                             "(default: %(default)s).")
+    parser.add_argument("--response_latency_us", type=float, default=50.0,
+                        help="Delay from a fill at the exchange until the strategy receives the report "
+                             "(default: %(default)s).")
+    parser.add_argument("--latency_jitter_us", type=float, default=0.0,
+                        help="Mean of a random exponential delay added to every order and fill report.")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for the latency jitter.")
     parser.add_argument("--max_spread_ticks", type=float, default=None,
                         help="Only enter when the bid-ask spread is at most this many ticks (default: no limit).")
     parser.add_argument("--min_top_depth", type=int, default=0,
@@ -534,7 +706,12 @@ def main() -> None:
         initial_cash=args.initial_cash,
         exchange_fee=args.exchange_fee,
         routing_fee=args.routing_fee,
-        latency_us=args.latency_us,
+        fill_model=args.fill_model,
+        feed_latency_us=args.feed_latency_us,
+        order_latency_us=args.order_latency_us,
+        response_latency_us=args.response_latency_us,
+        latency_jitter_us=args.latency_jitter_us,
+        seed=args.seed,
         flatten_minutes=args.flatten_minutes,
         max_spread_ticks=args.max_spread_ticks,
         min_top_depth=args.min_top_depth,
