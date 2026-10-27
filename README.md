@@ -1,94 +1,59 @@
-# High-Frequency Order Book Imbalance (OBI) Backtester
+# Testing Order Book Imbalance in Crude Oil Futures
 
-## Project Goal
-The goal of this project is to develop an event-driven backtesting engine in Python that executes a micro-momentum trading strategy based on Order Book Imbalance (OBI) in commodity futures. 
+## What the results show
 
-Instead of relying on lagging indicators from executed trades, this project utilizes Level 2 order book depth to test whether the ratio of limit buy orders (bids) to limit sell orders (asks) resting in the book predicts short-term price movements. The current signal cutoff is a provisional heuristic, not an empirically established critical threshold. The strategy tests whether trades entered after an imbalance can capture a small tick-level profit before the book neutralizes.
+This project tests whether extreme order book imbalance (OBI) predicts short-term price movements in CME crude oil futures. The completed study provides an important negative result: on five October 2026 trading dates, none of the four tested OBI thresholds produced positive net PnL. The default 0.75 threshold generated 30,418 round trips and lost $500,032 after fees. At 0.95, the loss was smaller ($11,564), but the strategy still lost money on all five daily files. These findings do not establish a profitable threshold; they show why transaction costs, execution assumptions, and out-of-sample testing matter.
 
-## Data Source
-*   **Provider:** Databento
-*   **Schema:** Market by Price (MBP-10) - Top 10 levels of the order book.
-*   **Market:** CME Group (NYMEX / COMEX via Globex)
-*   **Target Assets:** Crude Oil (CL), Gold (GC), and Silver (SI). *Note: The architecture is modular, allowing the user to select which specific commodity to backtest.*
+| OBI threshold | Round trips | Wins | Gross PnL | Fees | Net PnL |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.75 | 30,418 | 45 | -$378,360 | $121,672 | -$500,032 |
+| 0.85 | 10,710 | 27 | -$113,700 | $42,840 | -$156,540 |
+| 0.90 | 3,495 | 10 | -$35,430 | $13,980 | -$49,410 |
+| 0.95 | 761 | 5 | -$8,520 | $3,044 | -$11,564 |
 
-## Order Book Imbalance Calculation
+![Net PnL by OBI threshold, split into gross trading loss and fees, and net PnL of every daily run](threshold_optimization/threshold_study.png)
 
-The Order Book Imbalance (OBI) measures the relative difference between bid-side and ask-side liquidity at each market event.
+The study used 12,813,597 book events from five full CL MBP-10 daily files covering UTC dates October 5–10, 2026; the shorter October 4 file was excluded. Each day and threshold was backtested independently with $100,000 starting cash, one contract, two-tick take-profit and stop-loss settings, and $2 in fees per contract per side. Daily PnL is summed across independent runs, not compounded. At 0.75, each daily run reached the equity stop and stopped opening new positions. Raising the threshold reduced trade count and losses, but the result at 0.95 is not evidence that it is a suitable setting.
 
-OBI is calculated as:
+The reason is the size of the edge. After an extreme imbalance, the mid price moves only about 0.3 ticks in the predicted direction, while crossing the spread in and out costs at least one tick plus about 0.4 ticks of fees. With realistic exchange latency (see [Execution latency](#execution-latency)), every threshold loses more, because most of the predicted move happens before an order can reach the exchange. The signal is real, but too weak to pay for taking liquidity.
+
+Detailed daily and aggregate metrics are available in [`threshold_optimization/daily_results.csv`](threshold_optimization/daily_results.csv) and [`threshold_optimization/threshold_summary.csv`](threshold_optimization/threshold_summary.csv). The analysis is exploratory and in-sample: it covers one contract and five dates, and is neither a holdout evaluation nor a statistical significance test. Further research should use additional markets and periods, a time-separated holdout, and realistic execution-cost assumptions before drawing conclusions about predictive value.
+
+## Data and signal
+
+The project uses Databento Market by Price data with ten levels of CME Globex order-book depth. The downloader supports continuous front-month CL, GC, and SI symbols; the stored studies specifically evaluate CL. For each event, OBI compares weighted bid and ask displayed sizes:
 
 `OBI = (weighted_bid - weighted_ask) / (weighted_bid + weighted_ask)`
 
-The implementation supports configurable order book levels (0–9), with level 0 (best bid and ask) used by default.
+The default calculation uses the best bid and ask (level 0). The implementation can also combine selected levels from 0 to 9, assigning higher linear weights to levels nearer the top of the book. OBI ranges from -1 to +1. The signal generator labels observations above the configured positive threshold as BUY, below its negative as SELL, and all others as neutral. The default threshold of 0.75 is a configurable research baseline, not a validated trading parameter.
 
-When multiple levels are selected, linearly decreasing weights are assigned based on order book depth:
-* Level 0 receives the highest weight (10), decreasing to level 9 (1).
-* Weights are normalized to sum to 1 across selected levels.
-* Weighted bid and ask sizes are calculated before computing OBI.
+## Event-driven backtest
 
-The resulting OBI ranges from -1 to 1, where positive values indicate greater bid-side liquidity and negative values indicate greater ask-side liquidity.
+The Python backtester (`src/backtester.py`) replays the book events in time order and simulates the strategy on the generated signals. It opens a position only when flat, and closes it at the configured profit or loss distance, when OBI crosses back through zero, near the session close, or at the end of the data. A decision never fills at the quote that generated it. Buys cross at the ask and sells at the bid, with configurable exchange and routing fees. Optional entry filters limit spread and require displayed size at the touch.
 
-## Trading Signal Generation
+By default, orders are filled with a latency model. Every record has two clocks: `ts_event` (CME's matching engine) and `ts_recv` (Databento's capture server, which sits with the matching engine in Aurora). The strategy sees an event after `ts_recv`; its order reaches the matching engine 50 µs after the decision and executes against the book as it stood at that moment in exchange time, often a book the strategy has not received yet. The fill report takes another 50 µs, and only then does the strategy act on its new position. These defaults describe a software strategy colocated with CME; feed, order and report delays and random jitter are configurable. `--fill_model next_event` keeps the original approximation, which fills on the next event received, and reproduces the threshold study above.
 
-Trading signals are generated based on the calculated OBI using a configurable threshold (default: 0.75):
+The engine excludes crossed books and events that do not complete an exchange packet, avoids the CME maintenance break and weekends, and stops entering shortly before the daily close. A $100,000 futures portfolio records realized cash flows and mark-to-market equity, and new entries stop once equity reaches zero. These safeguards make the simulation more explicit than a signal-only calculation, but it remains a backtest: displayed liquidity, modeled fills, and configured costs are not a guarantee of live execution.
 
-* **BUY (+1):** OBI > 0.75
-* **SELL (-1):** OBI < -0.75
-* **NEUTRAL (0):** Otherwise.
+![Equity curve of the default backtest over October 5–9, 2026](figures/equity_curve.png)
 
-The default of 0.75 is a provisional, a priori choice; it has not been established as a statistically or economically meaningful cutoff. See [Critical Threshold Validation](#critical-threshold-validation) for the available sample analysis.
+Run over the whole week at the default 0.75 threshold, the strategy makes 5,184 round trips with a 0.17% win rate and loses its $100,000 within the first trading day (net −$100,016: −$79,280 gross and $20,736 in fees), after which the equity stop blocks new entries. Almost all trades (4,968 of 5,184) close because level-0 OBI flips sign within milliseconds (median holding 3.6 ms), which locks in the spread.
 
-The script processes OBI data from `data/processed/` and saves the resulting signals in `data/signals/`. Previously generated files are reused when available.
+Backtests write a fill-level trade log and equity curve to `results/`. The reporting module summarizes PnL, win rate, trade count, and drawdown, checks the trade log against the engine's own PnL, and can generate an equity chart and a price/OBI chart.
 
-## Critical Threshold Validation
+## Spread and displayed size
 
-**Conclusion:** The current sample does not empirically support 0.75 as a profitable critical threshold, and it does not establish another cutoff as suitable. The default remains unchanged as a configurable research baseline; it must not be interpreted as a validated trading parameter.
+`src/spread_size_analysis.py` measures, for every entry signal, how far the mid price moves in the signal's direction after 100 ms, 1 second, and 10 seconds, and compares it with the estimated round-trip cost of crossing the spread plus fees.
 
-### Sample and method
+![Net edge of OBI signals by bid-ask spread and by size at the touch](figures/spread_size_analysis.png)
 
-The sensitivity check used the five full CL MBP-10 files for UTC dates October 5–10, 2026 (12,813,597 book events in total). The shorter October 4 file was excluded. OBI was calculated at level 0, as in the default configuration. Each daily file was backtested independently at thresholds 0.75, 0.85, 0.90, and 0.95 using the default one-contract size, two-tick take-profit and stop-loss, $2.00 per-contract-per-side fees, trading-hour/book-quality filters, $100,000 initial cash, and the original next-event fill approximation (`--fill-model next_event`). Each run starts with fresh cash and liquidates any remaining position at that file's end; the daily net PnL figures below are summed, not compounded. Positive round-trip PnL defines a win.
+The net edge is negative in every bucket and at every horizon. Signals on a 1-tick spread come closest, at about −1.1 ticks, and wider spreads only add cost: the forward move stays near 0.3 ticks while the cost grows with the spread. Displayed size at the touch barely changes the result. The edge is measured from the signal's own quote, as if orders filled instantly, so it is optimistic.
 
-### Results
+## Execution latency
 
-The detailed reproducible output is in [`threshold_optimization/`](threshold_optimization/): per-day metrics in [`daily_results.csv`](threshold_optimization/daily_results.csv), aggregate comparisons in [`threshold_summary.csv`](threshold_optimization/threshold_summary.csv), and rerun instructions in that folder's README.
+The original fill rule, filling on the next event Databento received, turned out to be both too fast and stale. On the five full CL days (12.3 million tradable events and 325,785 entry signals at OBI > 0.75), the next event arrived a median 0.21 ms after the signal, faster than any real order can react. And because Databento's capture lags the matching engine by a median 0.56 ms (1.37 ms at entry signals, which arrive in bursts), for 81% of signals the book the old rule filled against had already existed at the exchange before the decision was made.
 
-| OBI threshold | Round trips | Winning trades | Gross PnL | Fees | Net PnL |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 0.75 | 30,418 | 45 (0.15%) | -$378,360 | $121,672 | -$500,032 |
-| 0.85 | 10,710 | 27 (0.25%) | -$113,700 | $42,840 | -$156,540 |
-| 0.90 | 3,495 | 10 (0.29%) | -$35,430 | $13,980 | -$49,410 |
-| 0.95 | 761 | 5 (0.66%) | -$8,520 | $3,044 | -$11,564 |
-
-Every threshold lost money on every daily file. At 0.75, each daily run reached the equity stop that prevents new entries. Raising the cutoff reduced the number of trades and therefore the fees and losses, but even 0.95 lost money on all five files and produced only five winning round trips. This is evidence against treating 0.75 as a validated profitability threshold; the smaller loss at 0.95 is not evidence that 0.95 is a good threshold.
-
-This is a limited, exploratory in-sample sensitivity check on one contract and five dates, not a holdout test or a statistical significance analysis. The results do not justify tuning the default to 0.95 (or any other tested value). Before selecting a production cutoff, evaluate additional periods and instruments, use a time-separated holdout, and account for selection bias and realistic execution costs.
-
-With realistic message latency (the backtester's default colocated profile, see [Execution Latency](#execution-latency)) every threshold loses more: net PnL is −$190,082 at 0.85 (was −$156,540), −$65,882 at 0.90 (was −$49,410) and −$17,986 at 0.95 (was −$11,564), and 0.75 still reaches the equity stop on every day. Running `src/threshold_analysis.py` without `--fill-model next_event` gives these latency-model figures.
-
-
-## Backtest Execution Engine
-
-`src/backtester.py` steps through every MBP-10 book event in the order Databento received it and simulates trading on the signals:
-
-* **Entry:** when flat, buy 1 contract on a BUY signal and sell 1 contract on a SELL signal.
-* **Exit:** take-profit or stop-loss when the mid price has moved the set number of ticks (default 2) from the mid at entry, or when OBI crosses back through 0.
-* **Execution (latency model, default):** every record has two clocks, `ts_event` (CME's matching engine) and `ts_recv` (Databento's capture server, which sits with the matching engine in Aurora). The strategy sees an event `--feed_latency_us` after `ts_recv`. Its order reaches the matching engine `--order_latency_us` after the decision and executes against the book as it stood at that moment in exchange time: the last event with `ts_event` at or before the arrival, often one the strategy has not received yet. The fill report arrives `--response_latency_us` later, and only then does the strategy act on its new position, using the newest book it has seen. Buys pay `ask_px_00` and sells receive `bid_px_00` of that book. The defaults (0 / 50 / 50 µs) describe a software strategy colocated in Aurora; `--latency_jitter_us` adds a random exponential delay to every order and report (seeded by `--seed`). `--fill_model next_event` keeps the original approximation, which fills on the next event received. See [Execution Latency](#execution-latency).
-* **Book quality:** only events that complete an exchange packet (Databento `F_LAST` flag) with an uncrossed book are used, so trading halts and pre-open auctions are not traded.
-* **Trading hours:** no trading during the CME 16:00–17:00 CT maintenance break or the weekend; positions are flattened and entries stop 1 minute before the 16:00 CT close. Any position left at the end of the data is closed at the last quote.
-* **Portfolio:** starts with $100,000. As with futures, cash changes only by realized PnL and fees; equity also includes open-position PnL marked at the bid (long) or ask (short). New entries stop once equity reaches zero.
-* **Fees:** $1.50 CME exchange fee plus $0.50 routing fee per contract per fill (`--exchange_fee`, `--routing_fee`). These are approximate and configurable.
-* **Spread and size filters (optional):** `--max_spread_ticks N` skips entries when the bid-ask spread is wider than N ticks, and `--min_top_depth N` skips entries when best bid size plus best ask size is below N contracts. An entry also needs the side it crosses to show at least `--quantity` contracts. Exits are never filtered. MBP-10 data does not separate implied (spread-derived) orders, so "size" here means the displayed size at the touch.
-
-Other options include `--stop_loss_ticks`, `--quantity` and `--flatten_minutes`. The trade log has one row per fill: `ts_event` is when the order executed at the exchange, `ts_recv` when the strategy received the fill report, `ts_sent` when it sent the order, and `decision_ts_recv` / `decision_price` give the book event and quote it decided on. The columns `ts_event, side, price, quantity, fee` are the input format for the reporting module.
-
-## Execution Latency
-
-The original engine filled each order on the next book event Databento received after the decision. Measured on the five full CL days (October 5–9, 2026; 12.3 million tradable events and 325,785 entry signals at OBI > 0.75), that approximation was both too fast and stale:
-
-* **Too fast.** The next event arrived a median 0.21 ms after the signal, and within 50 µs for 20% of signals. No real order can react that quickly.
-* **Stale.** Databento's capture lags the matching engine by a median 0.56 ms (90th percentile 5.8 ms), and by 1.37 ms at entry signals, which arrive in bursts. So for 81% of signals, the book the old rule filled against had already existed at the exchange *before* the decision was made (a median 1.1 ms earlier). The old trade logs show fills with a `ts_event` earlier than their own decision.
-
-The latency model fixes both: an order executes against the exchange's book at the moment it arrives, and the strategy waits for its fill reports. `src/latency_analysis.py` re-ran every daily file under the scenarios below and four thresholds, starting each run with enough cash that the equity stop never ends a day early. Full tables, assumptions and sources are in [`latency_analysis/`](latency_analysis/).
+`src/latency_analysis.py` re-ran every daily file under seven latency scenarios and four thresholds (140 backtests). Order and fill-report delays cannot be observed in market data, so they are round-number assumptions from public figures, reported across a wide range. Full tables, sources, and caveats are in [`latency_analysis/`](latency_analysis/).
 
 | Scenario | One-way delays: feed / order / fill report |
 | --- | --- |
@@ -101,74 +66,62 @@ The latency model fixes both: an order executes against the exchange's book at t
 
 ![Entry slippage by latency and net PnL per round trip by scenario](latency_analysis/latency_analysis.png)
 
-**Entry cost.** Across all entry signals, the old rule paid 0.12 ticks more than the quote the strategy saw. With the order reaching the exchange the instant Databento receives the signal, it pays 0.22 ticks; at 1 ms, 0.26 ticks; at 10 ms, 0.29; at 100 ms, 0.33. Most of this is the mid price moving in the signal's direction before the order arrives: 0.17 ticks already at zero added latency, out of the roughly 0.3 ticks the signal predicts in total ([#26](https://github.com/aarbitman1228/finm-37000-final-project-group-10/issues/26)). Most of the predicted move happens before any order can reach the exchange.
+The old rule paid 0.12 ticks more than the quote the strategy saw at entry. With the order reaching the exchange the instant Databento receives the signal, an entry pays 0.22 ticks; at 100 ms, 0.33 ticks. Most of that is the mid price moving in the signal's direction before the order arrives, so most of the predicted 0.3-tick move is gone before any order can trade on it.
 
-**Backtests, OBI > 0.75** (five days summed; slippage in ticks per fill):
-
-| Scenario | Round trips | Win rate | Net PnL | Net / round trip | Entry slippage | Exit slippage | Median holding |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Next event (old model) | 86,707 | 0.11% | −$1,344,608 | −$15.51 | 0.11 | 0.03 | 5.4 ms |
-| Zero | 87,850 | 0.15% | −$1,500,070 | −$17.08 | 0.22 | 0.05 | 5.2 ms |
-| Colocated (default) | 87,628 | 0.17% | −$1,505,452 | −$17.18 | 0.23 | 0.05 | 5.3 ms |
-| Chicago metro | 84,689 | 0.23% | −$1,476,426 | −$17.43 | 0.25 | 0.08 | 5.8 ms |
-| New York | 69,982 | 0.42% | −$1,235,168 | −$17.65 | 0.27 | 0.10 | 18.6 ms |
-| Remote 10 ms | 63,658 | 0.56% | −$1,136,222 | −$17.85 | 0.28 | 0.11 | 39.3 ms |
-| Remote 50 ms | 53,449 | 0.98% | −$989,526 | −$18.51 | 0.31 | 0.14 | 126.3 ms |
-
-**Net PnL per round trip by threshold:**
-
-| Scenario | 0.75 | 0.85 | 0.90 | 0.95 |
+| Scenario (OBI > 0.75, five days) | Round trips | Net PnL | Net per round trip | Entry slippage (ticks) |
 | --- | ---: | ---: | ---: | ---: |
-| Next event (old model) | −$15.51 | −$14.62 | −$14.14 | −$15.20 |
-| Zero | −$17.08 | −$17.10 | −$17.51 | −$21.07 |
-| Colocated (default) | −$17.18 | −$17.19 | −$17.79 | −$21.06 |
-| Chicago metro | −$17.43 | −$17.28 | −$17.78 | −$20.83 |
-| New York | −$17.65 | −$17.38 | −$17.60 | −$19.38 |
-| Remote 10 ms | −$17.85 | −$17.55 | −$17.55 | −$18.73 |
-| Remote 50 ms | −$18.51 | −$18.00 | −$17.94 | −$18.56 |
+| Next event (old model) | 86,707 | −$1,344,608 | −$15.51 | 0.11 |
+| Zero | 87,850 | −$1,500,070 | −$17.08 | 0.22 |
+| Colocated (default) | 87,628 | −$1,505,452 | −$17.18 | 0.23 |
+| Chicago metro | 84,689 | −$1,476,426 | −$17.43 | 0.25 |
+| New York | 69,982 | −$1,235,168 | −$17.65 | 0.27 |
+| Remote 10 ms | 63,658 | −$1,136,222 | −$17.85 | 0.28 |
+| Remote 50 ms | 53,449 | −$989,526 | −$18.51 | 0.31 |
 
-### Conclusions
+These runs start with enough cash that the equity stop never ends a day early, so every scenario trades the same hours; that is why the totals are larger than in the threshold study. Every latency scenario loses $1.6 to $5.9 more per round trip than the old approximation, which was optimistic rather than conservative. Slower setups make fewer trades but are no better per trade. None of the 140 daily runs made money. Rerunning the threshold study with the default colocated latency model gives net PnL of −$190,082 at 0.85, −$65,882 at 0.90, and −$17,986 at 0.95, versus the next-event figures in the first table; 0.75 still reaches the equity stop on every day.
 
-* **The old approximation was optimistic, not conservative.** Every latency scenario loses more per round trip than the next-event model: $1.6 to $5.9 more even with zero added latency. At 0.75, this holds on each of the five days, and the per-trip loss rises with every step in latency on each day.
-* **Most of the damage happens before any order can arrive.** Even a colocated strategy sees a signal a median 1.4 ms after the book event that caused it. Extra latency adds a smaller, steady cost on top.
-* **Slower setups trade less but no better.** At 50 ms, the strategy makes 39% fewer round trips and holds for 126 ms instead of 5 ms. Total losses shrink only because there are fewer trades. At 0.95 the per-trip loss is largest at low latency, because the most extreme imbalances are the ones the market has most often already traded through (0.67 ticks of entry slippage). Slower setups enter fewer of them and pay less per entry (0.42–0.45 ticks), which looks like a selection effect rather than a benefit of latency.
-* **None of the 140 daily runs** (7 scenarios × 4 thresholds × 5 days) made money. Under realistic latency the conclusion from [#26](https://github.com/aarbitman1228/finm-37000-final-project-group-10/issues/26) is stronger: OBI predicts the direction, but by the time an order arrives too little of the move is left to pay for crossing the spread.
+The latency model covers one-lot orders that take liquidity: there is no queue position or market impact, and the order does not change the historical book it trades against.
 
-**Limitations.** Order and fill-report delays cannot be observed in market data, so they are assumptions, reported over a wide range. Databento's `ts_recv` stands in for a colocated feed handler. The model covers one-lot orders that take liquidity: no queue position or market impact, and a quantity above the displayed size still fills at the touch. Delays are constant unless jitter is enabled. The sample is CL only and five in-sample days.
+## Time of day and signal timing
 
-## How to Run the Project
-1. **Clone the repository:** 
-   `git clone https://github.com/aarbitman1228/finm-37000-final-project-group-10.git`
-2. **Install dependencies:** 
-   `pip install -r requirements.txt` (installs `databento`, `pandas`, `pyarrow`, `python-dotenv`, `matplotlib`, and `pytest`)
-3. **Configure API:** 
-   Create a `.env` file in the root directory and add your Databento API key: `DATABENTO_API_KEY=your_key_here`.
-4. **Fetch Limit Order Data:** 
-   Run `python src/fetch_mbp_data.py` from a terminal for a one-week CL sample (October 4–10, 2026; the end date is exclusive). The script checks each day's estimated size and cost, asks once for confirmation, and saves one compressed Parquet file per day in `data/raw/`. Completed daily files are reused if a run is restarted. Use `--symbol GC.c.0` or `--symbol SI.c.0` to select another contract, or `--start` and `--end` to change the date range.
-5. **Calculate Order Book Imbalance:**
-   Run `python src/order_book_imbalance.py` to process all Parquet files in `data/raw/`. Results are saved in `data/processed/`, with previously processed files reused when available.
-6. **Generate Trading Signals:**
-   Run `python src/trading_signals.py` to turn the OBI files in `data/processed/` into BUY/SELL/NEUTRAL signals at the default 0.75 threshold. Results are saved in `data/signals/`, with previously generated files reused when available. The backtester also creates any missing OBI and signal files itself.
-7. **Run the Backtest Simulation:** 
-   Execute `python src/backtester.py --imbalance_threshold 0.75 --take_profit_ticks 2` to run the historical simulation with the default colocated latency. Add, for example, `--feed_latency_us 290 --order_latency_us 340 --response_latency_us 340` for a Chicago-metro setup, or `--fill_model next_event` for the original approximation.
-8. **Review Outcomes:** 
-   The reporting module reads the backtester output (`results/trade_log.csv` and, if present, `results/equity_curve.csv`):
-   `python src/reporting.py --symbol CL --imbalance_threshold 0.75`
-   This writes `results_summary.txt` (net PnL, win rate, trade count, max drawdown, plus a cross-check against the engine's `realized_pnl`), `visualizations/equity_curve.png`, and `visualizations/price_and_obi.png`. Use `--trades` / `--equity` to point at other files, and run the tests with `pytest tests/`.
-9. **Analyze Spread and Size:**
-   Run `python src/spread_size_analysis.py --symbol CL` to measure, for every signal, how far the mid price moves in the signal's direction after 0.1, 1 and 10 seconds (`--horizons_ms`) against the cost of crossing the spread in and out plus fees, grouped by spread and by size at the touch. It writes `results/spread_size_analysis.csv` and `visualizations/spread_size_analysis.png`. Compare runs of `backtester.py` with and without `--max_spread_ticks` / `--min_top_depth` to see the effect on PnL. The edge is measured from the signal's own quote, as if orders filled instantly, so it is optimistic: with realistic latency each entry also pays about 0.22–0.33 ticks of slippage (see [Execution Latency](#execution-latency)).
-10. **Evaluate Latency:**
-   Run `python src/latency_analysis.py --start_date 2026-10-05 --end_date 2026-10-10` (about two minutes) to measure the feed delay, the entry cost at each latency, and backtests for every latency scenario and threshold. It writes the CSV files and chart in [`latency_analysis/`](latency_analysis/).
+The notebook [`Notebook/time_signals.ipynb`](Notebook/time_signals.ipynb) examines when signals occur and how long they last, on the same CL sample.
 
-## Team Agreement
+![Average absolute OBI by hour of day, Chicago time](figures/time_of_day_abs_obi.png)
 
-Each team member confirms they have reviewed this README and the open Issues, and agrees this plan accurately reflects what the team discussed.
+Signals are not spread evenly through the day. At 1:00 PM Chicago time, about 7.72% of market events generate an active signal, the highest hourly share; the same hour has both the deepest top of book (12.16 contracts on average) and the most imbalanced book (average absolute OBI of 0.368). Signal events also arrive in bursts, averaging about 21 ms since the previous event, compared with 33.78 ms for events without a signal. And signals are short-lived: a Buy or Sell signal lasts a median of two consecutive events. A time-of-day filter, event spacing as a feature, or a minimum persistence requirement are possible next steps; none has been backtested, and the patterns should be checked over more weeks.
 
-| Name | Agreement |
-|------|-----------|
-| Andrew Arbitman | I agree — @aarbitman1228 |
-| Rodrigo Castillo | I agree — @RoCa5tillo |
-| Xiaohan Zhu | I agree — @zhucolatee |
-| Jessica Xu | I agree — @Jessicakk0711 |
+## Reproducing the results
 
-> To register your agreement: edit this table to add your name and GitHub handle, or leave a comment or reaction on the PR that introduced this README.
+`src/threshold_analysis.py` reuses the OBI and backtest implementations to compare thresholds by day; the checked-in CSV files are the results described above, and the companion [`threshold_optimization/README.md`](threshold_optimization/README.md) documents the study configuration and rerun options. `src/latency_analysis.py` produces the latency study in [`latency_analysis/`](latency_analysis/). Unit tests cover the backtester, latency analysis, reporting, spread/size analysis, and threshold analysis.
+
+## Running the project
+
+Install dependencies with `pip install -r requirements.txt`. To download data, provide a Databento API key in a root `.env` file as `DATABENTO_API_KEY=your_key_here`. The downloader estimates request size and cost and prompts before fetching unless `--yes` is supplied.
+
+From the project root:
+
+```bash
+# Fetch the default CL sample (October 4–10, 2026; end date is exclusive).
+python src/fetch_mbp_data.py
+
+# Backtest the available CL data with the default OBI threshold and latency model.
+python src/backtester.py --symbol CL --imbalance_threshold 0.75
+
+# Summarize a backtest and generate its charts.
+python src/reporting.py --symbol CL --imbalance_threshold 0.75
+
+# Reproduce the five-day threshold comparison (next-event fills, as in the table above) and its chart.
+python src/threshold_analysis.py --start-date 2026-10-05 --end-date 2026-10-10 --fill-model next_event
+python src/plot_threshold_study.py
+
+# Run the forward-move spread/size analysis.
+python src/spread_size_analysis.py --symbol CL
+
+# Re-evaluate the strategy under each latency scenario (about two minutes).
+python src/latency_analysis.py --start_date 2026-10-05 --end_date 2026-10-10
+
+# Run the tests.
+pytest tests/
+```
+
+The backtester also accepts alternative symbols, thresholds, tick targets, fee assumptions, fill models and latencies, spread/depth filters, input directories, and output directories. Use `--help` on a script for its complete options. The threshold and latency analyses write their CSVs and charts under `threshold_optimization/` and `latency_analysis/`; other commands write to the `results/` and `visualizations/` directories unless configured otherwise. The charts in `figures/` are copies of the `visualizations/` output for the default run and of the time-of-day notebook.
